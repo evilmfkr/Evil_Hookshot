@@ -1331,6 +1331,12 @@ uint64_t gpu_pool_end(uint64_t gpu) {
     const Pool* p = pool_of(gpu, 1);
     return p ? p->hi : 0;
 }
+uint64_t gpu_pool_start(uint64_t gpu) {   // (EvilOOT) where it begins
+    ParLock plk;
+    std::lock_guard lk(pools_mu);
+    const Pool* p = pool_of(gpu, 1);
+    return p ? p->lo : 0;
+}
 
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (written) texture_gpu_wrote(gpu, size);

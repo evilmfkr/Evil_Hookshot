@@ -4,8 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <boost/container/flat_set.hpp>
 #include <boost/container/small_vector.hpp>
@@ -19,7 +21,37 @@
 #include "shader_recompiler/ir_opt/passes.h"
 
 namespace Shader::Optimization {
+
+/// (EvilOOT) RX_VK_PTR_DIAG=1: how this thread's last translations' global memory accesses were bound, read and reset by
+/// gpu/vk/vk_shader.cpp around each program (no header: declared there by hand, so Eden's ~500 files do not rebuild).
+///   tracked   bound to a constant buffer pointer, the address made from constant buffer words only
+///   fallback  not tracked: the run-time search (NVN slots, tables, the mesh pointer table), table = a table was found
+///   mixed     bound to a constant buffer pointer although part of the address comes from memory (often only an index)
+///   split     bound to a constant buffer pointer while a select or phi gives the address either from constant buffer
+///             words or from memory (a pointer loaded through it): EvilOOT's near-leaf bug (zortos293/Lichii #410), the
+///             loaded pointer's reads go to the wrong buffer
+///   fallback_split  the same pattern among the fallbacks
+struct PointerDiag {
+    u32 tracked, fallback, fallback_table, mixed, split, fallback_split;
+};
+thread_local PointerDiag g_pointer_diag{};
+// (collect_shader_info_pass.cpp: NVN2 compute's storage buffer slots for the program translated on this thread, 0: not compute)
+extern thread_local u32 g_nvn2_compute_ssbo_base;
+extern thread_local u32 g_nvn2_compute_ssbo_count;
+
 namespace {
+bool PointerDiagOn() {
+    static const bool on = std::getenv("RX_VK_PTR_DIAG") != nullptr && std::atoi(std::getenv("RX_VK_PTR_DIAG")) != 0;
+    return on;
+}
+/// (EvilOOT) RX_VK_PTR_SPLIT_FALLBACK=1, experiment: a split address (see PointerDiag) is not bound to the constant buffer
+/// pointer on one side of its select or phi; it is left to the run-time search, which finds whichever bound buffer (or table
+/// entry, or mesh pointer table region) the address really falls in
+bool SplitFallbackOn() {
+    static const bool on = std::getenv("RX_VK_PTR_SPLIT_FALLBACK") != nullptr &&
+                           std::atoi(std::getenv("RX_VK_PTR_SPLIT_FALLBACK")) != 0;
+    return on;
+}
 /// Address in constant buffers to the storage buffer descriptor
 struct StorageBufferAddr {
     auto operator<=>(const StorageBufferAddr&) const noexcept = default;
@@ -418,6 +450,69 @@ std::optional<StorageBufferAddr> TrackTable(const IR::Value& value) {
     return BreadthFirstSearch(value, pred);
 }
 
+/// (EvilOOT, RX_VK_PTR_DIAG) Where an address comes from: constant buffer words, memory (a global load: a pointer loaded
+/// from memory), and whether a select or phi joins values on the way. The walk stops at both kinds of source.
+/// split: a select or phi with a side from constant buffer words only and a side from memory (#410's pattern: the
+/// pointer is c0[x] or *c0[x], and only c0[x] gets bound). An index loaded from memory into a constant buffer
+/// pointer's offset is not split.
+struct AddrOrigins {
+    bool cbuf{}, load{}, branch{}, split{};
+};
+AddrOrigins Origins(const IR::Value& root, int depth = 0) {
+    AddrOrigins o;
+    if (root.IsImmediate()) {
+        return o;
+    }
+    boost::container::small_vector<const IR::Inst*, 64> stack{root.InstRecursive()};
+    std::unordered_set<const IR::Inst*> seen;
+    while (!stack.empty() && seen.size() < 1024) {
+        const IR::Inst* const inst{stack.back()};
+        stack.pop_back();
+        if (!seen.insert(inst).second) {
+            continue;
+        }
+        const IR::Opcode op{inst->GetOpcode()};
+        if (op == IR::Opcode::GetCbufU32 || op == IR::Opcode::GetCbufU32x2) {
+            o.cbuf = true;
+            continue;
+        }
+        if (IsGlobalMemory(*inst)) {
+            o.load = true;
+            continue;
+        }
+        size_t first{0};
+        switch (op) {
+        case IR::Opcode::Phi:
+            o.branch = true;
+            break;
+        case IR::Opcode::SelectU32:
+        case IR::Opcode::SelectU64:
+            o.branch = true;
+            first = 1;   // (not the condition)
+            break;
+        default:
+            break;
+        }
+        if (o.branch && !o.split && depth < 3 && (op == IR::Opcode::Phi || first == 1)) {
+            bool cbuf_only{}, from_memory{};
+            for (size_t i = first; i < inst->NumArgs(); ++i) {
+                const AddrOrigins side{Origins(inst->Arg(i), depth + 1)};
+                cbuf_only |= side.cbuf && !side.load;
+                from_memory |= side.load;
+                o.split |= side.split;
+            }
+            o.split |= cbuf_only && from_memory;
+        }
+        for (size_t i = first; i < inst->NumArgs(); ++i) {
+            const IR::Value arg{inst->Arg(i)};
+            if (!arg.IsImmediate()) {
+                stack.push_back(arg.InstRecursive());
+            }
+        }
+    }
+    return o;
+}
+
 /// Collects the storage buffer used by a global memory instruction and the instruction itself
 void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) {
     // NVN puts storage buffers in a specific range, we have to bias towards these addresses to
@@ -428,12 +523,34 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) 
         .offset_end = 0x700,
         .alignment = 16,
     };
+    // (EvilOOT, RX_VK_PTR_DIAG) counted on every way out of here
+    const bool diag{PointerDiagOn()};
+    const bool split_fallback{SplitFallbackOn()};
+    const AddrOrigins origins{diag || split_fallback ? Origins(inst.Arg(0)) : AddrOrigins{}};
+    const auto count_fallback{[&](bool table) {
+        if (diag) {
+            ++g_pointer_diag.fallback;
+            g_pointer_diag.fallback_table += table ? 1 : 0;
+            g_pointer_diag.fallback_split += origins.split ? 1 : 0;
+        }
+    }};
     // Track the low address of the instruction
     const std::optional<LowAddrInfo> low_addr_info{TrackLowAddress(&inst)};
     if (!low_addr_info) {
         // Failed to track the low address, use NVN fallbacks
+        count_fallback(false);
         return;
     }
+    // (EvilOOT) NVN2 compute: its own storage buffer slots are the bias (collect_shader_info_pass.cpp
+    // g_nvn2_compute_ssbo_base), not Maxwell's 0x100..0x700, which never matched: every compute access went to the
+    // unbiased track, which took the first constant buffer word it met
+    const Bias compute_bias{
+        .index = 0,
+        .offset_begin = g_nvn2_compute_ssbo_base,
+        .offset_end = g_nvn2_compute_ssbo_base + 16 * g_nvn2_compute_ssbo_count,
+        .alignment = 16,
+    };
+    const Bias* const bias{g_nvn2_compute_ssbo_base ? &compute_bias : &nvn_bias};
     // First try to find storage buffers in the NVN address
     const IR::U32 low_addr{low_addr_info->value};
     const auto cached_track = [&](const Bias* bias, auto& cache) {
@@ -448,22 +565,40 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) 
         cache.emplace(start, result);
         return result;
     };
-    std::optional<StorageBufferAddr> storage_buffer{cached_track(&nvn_bias, info.biased_tracks)};
+    std::optional<StorageBufferAddr> storage_buffer{cached_track(bias, info.biased_tracks)};
     if (!storage_buffer) {
         // If it fails, track without a bias
         storage_buffer = cached_track(nullptr, info.unbiased_tracks);
+        // (EvilOOT) c1 is the program's own constants: no buffer's address is known when a program is built, so a word of
+        // c1 in the address is an offset (OoT's culling passes: a pointer loaded from memory + c1[0] = 12, taken for the
+        // base: their results went to a buffer at address 12). Left to the run-time search, which finds the real one.
+        if (storage_buffer && storage_buffer->index == 1) {
+            storage_buffer.reset();
+        }
         if (!storage_buffer) {
             // If that also fails, use NVN fallbacks (and the table it reads the address from, if it does)
+            bool table_found{};
             if (!low_addr.IsImmediate()) {
                 if (const std::optional<StorageBufferAddr> table{TrackTable(low_addr)}) {
                     info.tables.insert(*table);
+                    table_found = true;
                 }
             }
+            count_fallback(table_found);
             LOG_WARNING(Shader, "Storage buffer failed to track, using global memory fallbacks");
             return;
         }
         LOG_DEBUG(Shader, "Storage buffer tracked without bias, index {} offset {}",
                     storage_buffer->index, storage_buffer->offset);
+    }
+    if (split_fallback && origins.split) {
+        count_fallback(false);   // (counted as a run-time search, split)
+        return;
+    }
+    if (diag) {
+        ++g_pointer_diag.tracked;
+        g_pointer_diag.mixed += origins.load ? 1 : 0;
+        g_pointer_diag.split += origins.split ? 1 : 0;
     }
     // Collect storage buffer and the instruction
     if (IsGlobalMemoryWrite(inst)) {

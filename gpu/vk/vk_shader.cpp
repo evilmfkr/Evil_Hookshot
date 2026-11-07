@@ -41,6 +41,41 @@
 
 #include "vk_internal.h"
 #include "vk_jobs.h"
+
+// (EvilOOT, RX_VK_PTR_DIAG) the pointer pass's counts for this thread's translations
+// (global_memory_to_storage_buffer_pass.cpp, declared by hand so no Eden header changes)
+namespace Shader::Optimization {
+struct PointerDiag {
+    uint32_t tracked, fallback, fallback_table, mixed, split, fallback_split;
+};
+extern thread_local PointerDiag g_pointer_diag;
+// (collect_shader_info_pass.cpp: NVN2 compute's storage buffer table for the program translated on this thread, and
+// where its c0 layout ends: a pointer table at 0x880 when it ends before)
+extern thread_local uint32_t g_nvn2_compute_ssbo_base;
+extern thread_local uint32_t g_nvn2_compute_ssbo_count;
+extern thread_local uint32_t g_nvn2_compute_layout_end;
+extern thread_local bool g_nvn2_miss_log_this;
+}
+namespace mkwvk {
+struct NvnState;
+uint32_t compute_ssbo_table(const NvnState& s, uint32_t* count, uint32_t* layout_end);   // (vk_bank.cpp)
+}
+namespace {
+bool ptr_diag_on() {
+    static const bool on = getenv("RX_VK_PTR_DIAG") && atoi(getenv("RX_VK_PTR_DIAG")) != 0;
+    return on;
+}
+void ptr_diag_reset() { Shader::Optimization::g_pointer_diag = {}; }
+/// One line a program whose global memory accesses are not all plain constant buffer pointers
+void ptr_diag_log(uint64_t key, const char* kind) {
+    if (!ptr_diag_on()) return;
+    const auto& d = Shader::Optimization::g_pointer_diag;
+    if (!d.fallback && !d.mixed && !d.split) return;
+    mkwvk::logf("vk: pointers %s %016llx: %u bound (%u with memory in the address, %u SPLIT), %u run-time search (%u through a table, "
+         "%u split)",
+         kind, (unsigned long long)key, d.tracked, d.mixed, d.split, d.fallback, d.fallback_table, d.fallback_split);
+}
+} // namespace
 #include "vk_shader.h"
 
 namespace mkwvk {
@@ -950,18 +985,43 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
 void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* fsc, const Code* csc,
                     const uint8_t color_types[8]) {
     const auto t0 = std::chrono::steady_clock::now();
+    ptr_diag_reset();
     try {
         Shader::Backend::Bindings bindings{};
         int questions = 0;
         std::vector<std::vector<uint32_t>> kept;   // (each stage's SPIR-V, for the program cache)
         if (csc) {
             Env env{s, *csc, Shader::Stage::Compute};
+            {   // (EvilOOT) where this program's storage buffer table is in c0 (NVN2's layout, not Maxwell's 0x310)
+                uint32_t count = 0, end = 0;
+                const uint32_t base = compute_ssbo_table(s, &count, &end);
+                Shader::Optimization::g_nvn2_compute_ssbo_base = count ? base : 0;   // (no table found: Maxwell's, as before)
+                Shader::Optimization::g_nvn2_compute_ssbo_count = count ? count : 16;
+                Shader::Optimization::g_nvn2_compute_layout_end = count ? end : 0;
+                // (RX_VK_MISS_LOG_PROG=<key prefix>: the miss log for that program only)
+                static const char* only = getenv("RX_VK_MISS_LOG_PROG");
+                char hex[24];
+                snprintf(hex, sizeof hex, "%016llx", (unsigned long long)p.key);
+                Shader::Optimization::g_nvn2_miss_log_this = !only || !strncmp(hex, only, strlen(only));
+            }
+            struct ResetTable {
+                ~ResetTable() {
+                    Shader::Optimization::g_nvn2_compute_ssbo_base = 0, Shader::Optimization::g_nvn2_compute_ssbo_count = 16;
+                    Shader::Optimization::g_nvn2_compute_layout_end = 0;
+                }
+            } reset_table;
             auto t = translate(env, false);
             questions += env.texture_questions;
             oot_visual(t->program, csc->key);
             Shader::RuntimeInfo rt{};
             dump_ir(p, "compute", t->program);   // (before the SPIR-V: the programs it fails on are the ones to read)
             const std::vector<uint32_t> spirv = Shader::Backend::SPIRV::EmitSPIRV(profile(), rt, t->program, bindings);
+            // (EvilOOT) RX_VK_DUMP_SPV=<folder>: the SPIR-V of the programs RX_VK_MISS_LOG_PROG names (all: unset), for spirv-val
+            if (const char* dir = getenv("RX_VK_DUMP_SPV"); dir && Shader::Optimization::g_nvn2_miss_log_this) {
+                char path[512];
+                snprintf(path, sizeof path, "%s/%016llx.spv", dir, (unsigned long long)p.key);
+                if (FILE* f = fopen(path, "wb")) fwrite(spirv.data(), 4, spirv.size(), f), fclose(f);
+            }
             Stage st;
             st.nvn_stage = 5;
             st.info = t->program.info;
@@ -1032,6 +1092,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             if (!st.module) throw Shader::LogicError("vkCreateShaderModule failed");
         if (questions) record_answers(p, s);
         st_translated++;
+        ptr_diag_log(p.key, csc ? "compute" : fsc ? "graphics" : "vertex");
         program_cache_save(p, kept);
     } catch (const std::exception& e) {
         p.failed = true;
@@ -1083,6 +1144,7 @@ int bank_stage(const Code& c) {
 void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const Code& mesh, const Code* prim,
                          const Code* fsc, const uint8_t color_types[8]) {
     const auto t0 = std::chrono::steady_clock::now();
+    ptr_diag_reset();
     try {
         Shader::Backend::Bindings bindings{};
         std::vector<std::vector<uint32_t>> kept;   // (each stage's SPIR-V, for the program cache: mesh programs were never kept,
@@ -1164,6 +1226,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             if (!st.module) throw Shader::LogicError("vkCreateShaderModule failed");
         record_answers(p, s);   // (task questions not counted: kept conservative)
         (void)questions;
+        ptr_diag_log(p.key, task ? "task+mesh" : "mesh");
         program_cache_save(p, kept);
         // (where its stages read their storage buffers: the driver bank layout of NVN2's stages 6 and 7)
         static std::atomic<int> logged_ssbo;

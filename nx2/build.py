@@ -265,7 +265,10 @@ def main():
                 [os.path.join(rt64, "a64_rt.c")]
         if a.standalone:
             srcs += [os.path.join(gen, f) for f in ("a64_stubs.c", "hos_image.c", "nvn2_exports.c")]
-            host_srcs = sorted(os.path.join(HOST, f) for f in os.listdir(HOST) if f.endswith(".c") and (f != "pgo_rt.c" or PGO == "gen"))
+            # (EvilOOT) host/rx_nowgpu.c stands in for the WebGPU renderer only when there is no wgpu-native to build it with
+            have_wgpu = os.path.isfile(os.path.join(WGPU, "include", "webgpu", "webgpu.h"))
+            host_srcs = sorted(os.path.join(HOST, f) for f in os.listdir(HOST) if f.endswith(".c") and (f != "pgo_rt.c" or PGO == "gen")
+                               and (f != "rx_nowgpu.c" or not have_wgpu))
         else:
             srcs += [os.path.join(NX2_RT, "eden_shim.c"), write_info(out)]
     # biggest first, so the long ones do not end up alone at the end

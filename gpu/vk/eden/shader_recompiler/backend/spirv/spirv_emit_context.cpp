@@ -968,13 +968,58 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     }
     using DefPtr = Id StorageDefinitions::*;
     const Id zero{u32_zero_value};
+    // (EvilOOT) the structure pointer type of a storage buffer of that member's elements, for OpArrayLength
+    const auto struct_pointer_of{[&](DefPtr m) -> Id {
+        if (m == &StorageDefinitions::U32) return storage_types.U32.array;
+        if (m == &StorageDefinitions::U32x2) return storage_types.U32x2.array;
+        if (m == &StorageDefinitions::U32x4) return storage_types.U32x4.array;
+        return Id{};
+    }};
+    // (EvilOOT, RX_VK_MISS_LOG) the miss log's descriptor (translate_program.cpp: c0+0xff0), -1 none. It is a single storage
+    // buffer like the real ones, so the searches skip it; an address none of them holds is recorded in it: word 0 counts
+    // the misses, then the first 63 addresses (low, high)
+    size_t miss_index{SIZE_MAX};
+    for (size_t i = 0; i < info.storage_buffers_descriptors.size(); ++i) {
+        const auto& d{info.storage_buffers_descriptors[i]};
+        if (d.count == 1 && d.cbuf_index == 0 && d.cbuf_offset == 0xff0U) {
+            miss_index = i;
+        }
+    }
+    const auto record_miss{[&](Id addr) {
+        if (miss_index == SIZE_MAX || !Sirit::ValidId(ssbos[miss_index].U32)) {
+            return;
+        }
+        const Id log{ssbos[miss_index].U32};
+        const Id counter{OpAccessChain(storage_types.U32.element, log, zero, zero)};
+        const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+        const Id slot{OpAtomicIAdd(U32[1], counter, scope, zero, Const(1U))};
+        // (the condition before the merge: OpSelectionMerge must come right before its branch; the driver crashed on it)
+        const Id room{OpULessThan(U1, slot, Const(63U))};
+        const Id then_label{OpLabel()};
+        const Id end_label{OpLabel()};
+        OpSelectionMerge(end_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(room, then_label, end_label);
+        AddLabel(then_label);
+        const Id at{OpIAdd(U32[1], OpShiftLeftLogical(U32[1], slot, Const(1U)), Const(1U))};
+        OpStore(OpAccessChain(storage_types.U32.element, log, zero, at), OpUConvert(U32[1], addr));
+        OpStore(OpAccessChain(storage_types.U32.element, log, zero, OpIAdd(U32[1], at, Const(1U))),
+                OpUConvert(U32[1], OpShiftRightLogical(U64, addr, Const(32U))));
+        OpBranch(end_label);
+        AddLabel(end_label);
+    }};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
                                auto&& callback) {
         AddLabel();
         const size_t num_buffers{info.storage_buffers_descriptors.size()};
         for (size_t index = 0; index < num_buffers; ++index) {
-            if (info.storage_buffers_descriptors[index].count > 1 || index >= info.nvn_buffer_used.size() ||
-                !info.nvn_buffer_used[index]) {
+            if (index == miss_index) {
+                continue;
+            }
+            // (EvilOOT) every single storage buffer the program has is searched by its address range. The old test,
+            // nvn_buffer_used[index], took a descriptor's place in the list for an NVN slot number: with the tracked
+            // buffers first, the slots' own descriptors past them were skipped and their reads gave 0. A match is exact,
+            // so searching a buffer the access never falls in costs a comparison and nothing else.
+            if (info.storage_buffers_descriptors[index].count > 1) {
                 continue;
             }
             const auto& ssbo{info.storage_buffers_descriptors[index]};
@@ -1018,8 +1063,16 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
                 const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
                 const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], entry_pointer))};
                 const Id ssbo_addr{OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask))};
-                const Id ssbo_size{OpUConvert(U64, OpCompositeExtract(U32[1], OpLoad(U32[2], size_pointer), 0U))};
-                const Id ssbo_end{OpIAdd(U64, unaligned_addr, ssbo_size)};
+                const Id size_word{OpCompositeExtract(U32[1], OpLoad(U32[2], size_pointer), 0U)};
+                Id ssbo_end{OpIAdd(U64, unaligned_addr, OpUConvert(U64, size_word))};
+                // (EvilOOT) an entry without a size (OoT's culling setup keeps bare pointers, the size word 0: the back end
+                // binds those up to 1 MB of their pool, vk_draw.cpp): the binding's own length is the end
+                if (const Id struct_pointer{struct_pointer_of(ssbo_member)}; Sirit::ValidId(struct_pointer)) {
+                    const Id elements{OpArrayLength(U32[1], OpAccessChain(struct_pointer, table_id, Const(k)), 0U)};
+                    const Id bound_end{
+                        OpIAdd(U64, ssbo_addr, OpUConvert(U64, OpShiftLeftLogical(U32[1], elements, Const(shift))))};
+                    ssbo_end = OpSelect(U64, OpIEqual(U1, size_word, zero), bound_end, ssbo_end);
+                }
                 const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr), OpULessThan(U1, addr, ssbo_end))};
                 const Id then_label{OpLabel()};
                 const Id else_label{OpLabel()};
@@ -1032,6 +1085,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
                 AddLabel(else_label);
             }
         }
+        record_miss(addr);   // (EvilOOT, RX_VK_MISS_LOG: here no buffer held the address)
     }};
     const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
         const Id function_type{TypeFunction(type, U64)};
