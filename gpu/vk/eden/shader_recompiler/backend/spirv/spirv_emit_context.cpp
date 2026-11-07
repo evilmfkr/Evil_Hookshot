@@ -1079,6 +1079,9 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             miss_index = i;
         }
     }
+    if (miss_index != SIZE_MAX && Sirit::ValidId(ssbos[miss_index].U32)) {
+        probe_log = ssbos[miss_index].U32;   // (RX_VK_BLOCK_PROBE, emit_spirv.cpp Traverse)
+    }
     const auto record_miss{[&](Id addr) {
         if (miss_index == SIZE_MAX || !Sirit::ValidId(ssbos[miss_index].U32)) {
             return;

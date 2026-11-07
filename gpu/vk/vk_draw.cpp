@@ -101,7 +101,8 @@ struct GpuDumpRec { uint64_t prog, addr; uint32_t slot, bytes; int stage, index;
 std::vector<GpuDumpRec> stats_gpu_recs;
 // (RX_VK_MISS_LOG=1: each program's slice of one host-visible buffer, its c0+0xff0 descriptor: the global memory
 // accesses no binding held, counted, the first 63 addresses kept; translate_program.cpp, spirv_emit_context.cpp)
-constexpr uint32_t kMissSlice = 512, kMissSlices = 4096;
+// (RX_VK_BLOCK_PROBE: 16 KB slices, the per-block entry counters at word 128 + block, emit_spirv.cpp Traverse)
+const uint32_t kMissSlice = getenv("RX_VK_BLOCK_PROBE") ? 16384u : 512u, kMissSlices = getenv("RX_VK_BLOCK_PROBE") ? 1024u : 4096u;
 VkBuffer miss_buf = VK_NULL_HANDLE;
 VmaAllocation miss_mem = nullptr;
 uint32_t* miss_map = nullptr;
@@ -138,16 +139,21 @@ void stats_dump_stage(uint64_t prog, const NvnState& s, int stage) {
         if (!b.addr || !b.size) return;
         // (uniform buffers whole up to 2 KB and with the stream's inline updates, ub_read: what the shader reads)
         const bool ubo = kind[0] == 'u';
+        // (RX_VK_DUMP_LIVE=1: storage buffers as guest memory holds them now, not as submitted: what the CPU wrote since)
+        static const bool live = getenv("RX_VK_DUMP_LIVE") != nullptr;
+        const auto read = [&](uint64_t a, void* dst, uint64_t bytes) {
+            return ubo ? ub_read(a, dst, bytes) : live ? host->gpu_read(a, dst, bytes) : memory_read_as_submitted(a, dst, bytes);
+        };
         const uint64_t n = std::min<uint64_t>(b.size, ubo ? 0x800 : 0x400) & ~15ull;
         std::vector<uint32_t> w(n / 4);
-        if (w.empty() || !(ubo ? ub_read(b.addr, w.data(), n) : memory_read_as_submitted(b.addr, w.data(), n))) return;
+        if (w.empty() || !read(b.addr, w.data(), n)) return;
         uint64_t nonzero = 0, total = 0;   // (over the whole binding, up to 16 MB: is anything in it at all)
         uint64_t first_nz = UINT64_MAX;    // (and where the data past the first 64 bytes starts, 64 words of it shown)
         std::vector<uint32_t> at_nz;
         {
             const uint64_t all = std::min<uint64_t>(b.size, 16ull << 20) & ~3ull;
             std::vector<uint32_t> big(all / 4);
-            if (!big.empty() && memory_read_as_submitted(b.addr, big.data(), all))
+            if (!big.empty() && read(b.addr, big.data(), all))
                 for (size_t i = 0; i < big.size(); i++) {
                     nonzero += big[i] != 0, total++;
                     if (big[i] && i >= 16 && first_nz == UINT64_MAX) first_nz = i * 4;
@@ -2977,17 +2983,48 @@ void watch_note(uint64_t prog, uint64_t indirect) {
         }
     watch_seen.push_back({prog, {indirect, 0}});
 }
+// (RX_VK_WATCH_SB=<program>:<slot>:<offset>[,...], hex: a compute program's storage buffer slot + offset, as it binds it)
+std::vector<uint64_t> watch_sb_seen;
+void watch_note_sb(uint64_t prog, const NvnState& s) {
+    struct Want { uint64_t prog; uint32_t slot; uint64_t off; };
+    static const std::vector<Want> want = [] {
+        std::vector<Want> v;
+        for (const char* q = getenv("RX_VK_WATCH_SB"); q && *q && v.size() < 2;) {
+            char* e;
+            Want w{};
+            w.prog = strtoull(q, &e, 16);
+            if (*e != ':') break;
+            w.slot = (uint32_t)strtoul(e + 1, &e, 16);
+            if (*e != ':') break;
+            w.off = strtoull(e + 1, &e, 16);
+            v.push_back(w);
+            q = *e ? e + 1 : e;
+        }
+        return v;
+    }();
+    for (const Want& w : want) {
+        if (w.prog != prog || w.slot >= 16 || !s.ssbo[5][w.slot].addr) continue;
+        const uint64_t a = s.ssbo[5][w.slot].addr + w.off;
+        std::lock_guard lk(argwatch_mu);
+        if (std::find(watch_sb_seen.begin(), watch_sb_seen.end(), a) == watch_sb_seen.end()) {
+            watch_sb_seen.insert(watch_sb_seen.begin(), a);
+            if (watch_sb_seen.size() > 2) watch_sb_seen.pop_back();
+        }
+    }
+}
 void watch_arm() {   // (stats_tick, as a frame is armed)
     static const std::vector<uint64_t> fixed = parse_hex_list(getenv("RX_VK_WATCH_ADDRS"), kWatchMax);
     std::lock_guard lk(argwatch_mu);
     watch_live.clear();
     for (const uint64_t a : fixed) watch_live.push_back(a & ~15ull);
+    for (const uint64_t a : watch_sb_seen)
+        if (watch_live.size() < kWatchMax) watch_live.push_back(a & ~15ull);
     for (const auto& [p, a] : watch_seen)
         for (const uint64_t x : a)
             if (x && watch_live.size() < kWatchMax) watch_live.push_back(x & ~15ull);
 }
 const std::vector<uint64_t>& watch_addrs() { return watch_live; }
-bool watch_wanted() { return getenv("RX_VK_WATCH_ADDRS") || getenv("RX_VK_WATCH_ARGS_OF"); }
+bool watch_wanted() { return getenv("RX_VK_WATCH_ADDRS") || getenv("RX_VK_WATCH_ARGS_OF") || getenv("RX_VK_WATCH_SB"); }
 bool stats_mesh_bits = false;
 StatsMeta stats_meta[kStatsQueries];
 std::atomic<uint32_t> stats_used{0};
@@ -3229,6 +3266,15 @@ void stats_tick() {
                     addrs += t;
                 }
                 fprintf(f, "  %016llx %u misses:%s\n", (unsigned long long)prog, m, addrs.c_str());
+            }
+        }
+        if (getenv("RX_VK_BLOCK_PROBE") && miss_map) {   // (EvilOOT) the probed programs' blocks: invocations that entered each
+            std::lock_guard ml(miss_mu);
+            for (const auto& [prog, slot] : miss_slot) {
+                const uint32_t* w = miss_map + (size_t)slot * (kMissSlice / 4);
+                fprintf(f, "\n# block probe %016llx (invocations entering IR Block $n, since the frame was armed)\n", (unsigned long long)prog);
+                for (uint32_t b = 0; 128 + b < kMissSlice / 4; b++)
+                    if (w[128 + b]) fprintf(f, "  $%u %u\n", b, w[128 + b]);
             }
         }
         if (const std::vector<uint64_t>& w = watch_addrs(); !w.empty() && stats_watch_map) {   // (RX_VK_WATCH_ADDRS)
@@ -4609,6 +4655,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         }
         if (stats_prog_wanted(p.key)) stats_dump_stage(p.key, s, 5);   // (with each buffer's non-zero words)
     }
+    if (stats_dir()) watch_note_sb(p.key, s);   // (RX_VK_WATCH_SB)
     {
         StatsQuery stats_query(cmd, p.key, indirect, x, y, z);   // (EvilOOT, RX_VK_DRAW_STATS)
         if (indirect) {

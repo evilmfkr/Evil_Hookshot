@@ -515,6 +515,15 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             const auto c = c0;
             if (!c.size) break;
             BufferRef dst = gpu_buffer_bind(c.dst, c.size, true);
+            {   // (EvilOOT: RX_VK_WATCH_RANGE, the clears into it too)
+                unsigned long long lo = 0, hi = 0;
+                static const char* e = getenv("RX_VK_WATCH_RANGE");
+                if (e) sscanf(e, "%llx:%llx", &lo, &hi);
+                static int logged;
+                if (hi && c.dst < hi && c.dst + c.size > lo && logged++ < 400)
+                    logf("vk: watch range buffer clear %#llx (%#llx bytes) to %#x: %s", (unsigned long long)c.dst,
+                         (unsigned long long)c.size, (unsigned)c.value, dst ? "on the GPU" : "NOT bound");
+            }
             end_pass(cmd);
             full_barrier(cmd);
             if (dst && !(dst.offset & 3) && !(c.size & 3)) {
@@ -624,6 +633,20 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             // often the next frame's already (MKW refills it as soon as the submit returns): the terrain patches
             // took other patches' placements (holes in the far terrain, the minimap's triangles). RX_VK_DEFERRED_LATE=1:
             // read at the replay, as before.)
+            {   // (EvilOOT, RX_VK_LOG_DEFERRED=1: compute's deferred binds, as at the submit and as the array holds them now)
+                static const bool on = getenv("RX_VK_LOG_DEFERRED") != nullptr;
+                static std::atomic<int> told{0};
+                if (on && b.src && b.stage == 5 && told < 400) {
+                    NVNbufferRange now[16]{};
+                    const int n = std::clamp(b.n, 0, 16);
+                    host->gpu_read(b.src, now, (uint64_t)n * sizeof(NVNbufferRange));
+                    for (int i = 0; i < n && told < 400; i++, told++)
+                        logf("vk: deferred %s stage 5 slot %d (array %#llx): submit %#llx+%#llx, now %#llx+%#llx%s", b.ssbo ? "ssbo" : "ubo",
+                             b.first + i, (unsigned long long)b.src, (unsigned long long)b.r[i].address, (unsigned long long)b.r[i].size,
+                             (unsigned long long)now[i].address, (unsigned long long)now[i].size,
+                             now[i].address != b.r[i].address || now[i].size != b.r[i].size ? "  DIFFERS" : "");
+                }
+            }
             if (b.src && deferred_late()) {
                 const int n = std::clamp(b.n, 0, 16);
                 std::memset(b.r, 0, sizeof b.r);
