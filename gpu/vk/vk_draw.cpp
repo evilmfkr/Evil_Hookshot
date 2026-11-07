@@ -198,6 +198,48 @@ bool stats_prog_wanted(uint64_t key) {
     return std::find(want.begin(), want.end(), key) != want.end();
 }
 bool stats_frame_now();   // (below: the frame being measured is the current one)
+/// (EvilOOT) RX_VK_SKIP_FILE=<file>: the draws of the programs listed in it (hex keys, comma or newline separated) left out,
+/// the file read again whenever it changes (checked every 300 ms): a bisection in one run, from the scene being looked at
+bool skip_live(uint64_t key) {
+    static const char* path = getenv("RX_VK_SKIP_FILE");
+    if (!path || !*path) return false;
+    static std::mutex mu;
+    static std::vector<uint64_t> keys;
+    static std::atomic<int64_t> next_check{0};
+    static int64_t last_size = -1, last_time = -1;
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::lock_guard lk(mu);
+    if (now >= next_check.load(std::memory_order_relaxed)) {
+        next_check.store(now + 300, std::memory_order_relaxed);
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) {
+            const int64_t size = ((int64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+            const int64_t time = ((int64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+            if (size != last_size || time != last_time) {
+                last_size = size, last_time = time;
+                keys.clear();
+                if (FILE* f = fopen(path, "rb")) {
+                    std::string text;
+                    char buf[4096];
+                    for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+                    fclose(f);
+                    for (const char* q = text.c_str(); *q;) {
+                        char* e;
+                        const uint64_t k = strtoull(q, &e, 16);
+                        if (e == q) { q++; continue; }
+                        keys.push_back(k);
+                        q = e;
+                    }
+                    std::sort(keys.begin(), keys.end());
+                }
+                logf("vk: RX_VK_SKIP_FILE: %zu programs left out now", keys.size());
+            }
+        } else if (!keys.empty()) {
+            keys.clear(), last_size = last_time = -1;
+        }
+    }
+    return std::binary_search(keys.begin(), keys.end(), key);
+}
 void stats_note_bind(uint64_t prog, int stage, uint64_t addr, uint64_t size, bool written, bool table, uint32_t cbuf = 0,
                      uint32_t off = 0, uint64_t raw = 0, uint64_t vkbuf = 0, uint64_t vkoff = 0) {
     if (!stats_frame_now()) return;
@@ -1502,6 +1544,20 @@ void build_descriptors(const NvnState& s, const Program& p) {
                     if (w && w.buffer == b.buffer && w.offset == b.offset) b = w, n = wide_n;
                 }
                 // (census: every single descriptor, and table entries that hold something, with where they came from)
+                {   // (EvilOOT) the wanted programs' storage descriptors in order, once: descriptor n = the IR's "#n"
+                    static std::mutex lm;
+                    static std::unordered_set<uint64_t> told;
+                    static const bool stats_env = getenv("RX_VK_DRAW_STATS") != nullptr;
+                    if (stats_env && stats_prog_wanted(p.key)) {
+                        const size_t n_desc = (size_t)(&d - info.storage_buffers_descriptors.data());
+                        std::lock_guard lk(lm);
+                        const uint64_t tk = p.key ^ ((uint64_t)ns << 56) ^ ((uint64_t)n_desc << 48) ^ ((uint64_t)k << 40);
+                        if (told.insert(tk).second)
+                            logf("vk: descriptors of %016llx stage %d: #%zu[%u] c%u+%#x%s -> %#llx size %#llx (bound %s)", (unsigned long long)p.key,
+                                 ns, n_desc, k, (unsigned)d.cbuf_index, off, d.is_written ? " written" : "", (unsigned long long)addr,
+                                 (unsigned long long)size, b ? "yes" : "NO");
+                    }
+                }
                 if (d.count == 1 || addr) {
                     // (unresolved: the uniform buffer the word was read from, its address and size, in the vk fields)
                     const nvn_p_bind_buf* ub = d.cbuf_index >= 3 && d.cbuf_index < 3 + 16
@@ -3002,9 +3058,10 @@ void watch_note_sb(uint64_t prog, const NvnState& s) {
         }
         return v;
     }();
-    for (const Want& w : want) {
-        if (w.prog != prog || w.slot >= 16 || !s.ssbo[5][w.slot].addr) continue;
-        const uint64_t a = s.ssbo[5][w.slot].addr + w.off;
+    for (const Want& w : want) {   // (slot 0x10 and up: uniform buffer slot - 0x10)
+        const nvn_p_bind_buf* b = w.slot < 16 ? &s.ssbo[5][w.slot] : w.slot < 32 ? &s.ubo[5][w.slot - 16] : nullptr;
+        if (w.prog != prog || !b || !b->addr) continue;
+        const uint64_t a = b->addr + w.off;
         std::lock_guard lk(argwatch_mu);
         if (std::find(watch_sb_seen.begin(), watch_sb_seen.end(), a) == watch_sb_seen.end()) {
             watch_sb_seen.insert(watch_sb_seen.begin(), a);
@@ -3216,12 +3273,15 @@ void stats_tick() {
                 if (!stats_gpu_map) break;
                 const uint32_t* w = (const uint32_t*)(stats_gpu_map + (size_t)r.slot * kGpuDumpSlot);
                 uint64_t nonzero = 0;
-                for (uint32_t i = 0; i < r.bytes / 4; i++) nonzero += w[i] != 0;
-                fprintf(f, "\n%016llx s%d ssbo%d at %#llx AS THE GPU HELD IT after the draw (%llu of %u words non-zero):\n",
-                        (unsigned long long)r.prog, r.stage, r.index, (unsigned long long)r.addr, (unsigned long long)nonzero,
-                        r.bytes / 4);
-                for (uint32_t i = 0; i + 4 <= r.bytes / 4 && i < 96; i += 4)
-                    fprintf(f, "  +%03x: %08x %08x %08x %08x\n", i * 4, w[i], w[i + 1], w[i + 2], w[i + 3]);
+                uint32_t first = UINT32_MAX;
+                for (uint32_t i = 0; i < r.bytes / 4; i++)
+                    if (w[i]) nonzero++, first = std::min(first, i);
+                fprintf(f, "\n%016llx s%d ssbo%d at %#llx AS THE GPU HELD IT after the %s (%llu of %u words non-zero, first at +%x):\n",
+                        (unsigned long long)r.prog, r.stage, r.index, (unsigned long long)r.addr, r.stage == 5 ? "dispatch" : "draw",
+                        (unsigned long long)nonzero, r.bytes / 4, first == UINT32_MAX ? 0 : first * 4);
+                const uint32_t from = first == UINT32_MAX ? 0 : first & ~3u;
+                for (uint32_t i = from; i + 4 <= r.bytes / 4 && i < from + 64; i += 4)
+                    fprintf(f, "  +%05x: %08x %08x %08x %08x\n", i * 4, w[i], w[i + 1], w[i + 2], w[i + 3]);
             }
         }
         // (second level) pointers found in compute programs' pointer table regions that no binding or region of theirs covers
@@ -3278,6 +3338,20 @@ void stats_tick() {
             }
         }
         if (const std::vector<uint64_t>& w = watch_addrs(); !w.empty() && stats_watch_map) {   // (RX_VK_WATCH_ADDRS)
+            fprintf(f, "\n# watched addresses: bindings over them this frame (W written; tables left out)\n");
+            for (const uint64_t a : w) {
+                std::vector<std::string> seen;
+                for (const StatsBind& b : binds) {
+                    if (b.table || !b.addr || a < b.addr || a >= b.addr + b.size) continue;
+                    char t[96];
+                    snprintf(t, sizeof t, "%s%016llx@s%d[%#llx+%#llx]", b.written ? "W:" : "r:", (unsigned long long)b.prog, b.stage,
+                             (unsigned long long)b.addr, (unsigned long long)b.size);
+                    if (std::find(seen.begin(), seen.end(), t) == seen.end() && seen.size() < 40) seen.push_back(t);
+                }
+                fprintf(f, "  @%llx:", (unsigned long long)a);
+                for (const std::string& s2 : seen) fprintf(f, " %s", s2.c_str());
+                fprintf(f, "\n");
+            }
             fprintf(f, "\n# watched addresses, after each dispatch (shown where they changed; #n = its place in the frame)\n");
             std::vector<std::array<uint32_t, 4>> last(w.size(), {0xEEEEEEEEu, 0xEEEEEEEEu, 0xEEEEEEEEu, 0xEEEEEEEEu});
             for (uint32_t i = 0; i < n; i++) {
@@ -3394,11 +3468,11 @@ struct StatsQuery {
         vkCmdEndQuery(cmd, stats_pool, index);
         if (!is_dispatch) copy_args(cmd, *draw, index);   // (a dispatch's were copied before it ran: begin)
         if (is_dispatch) copy_watch(cmd, index);
-        if (state && !is_dispatch) gpu_dump(cmd, *state, prog);
+        if (state) gpu_dump(cmd, *state, prog, is_dispatch);
     }
     /// (RX_VK_DRAW_STATS_PROGS) the first 1 KB of each storage buffer of the mesh stage, as the GPU holds it after the draw,
     /// once per program: into stats_gpu (host-visible), printed with the report beside the memory view
-    static void gpu_dump(VkCommandBuffer cmd, const NvnState& s, uint64_t prog);
+    static void gpu_dump(VkCommandBuffer cmd, const NvnState& s, uint64_t prog, bool is_dispatch_dump = false);
     static void copy_args(VkCommandBuffer cmd, const DrawArgs& d, uint32_t index);
     static void copy_watch(VkCommandBuffer cmd, uint32_t index);
 };
@@ -3423,7 +3497,7 @@ void StatsQuery::copy_watch(VkCommandBuffer cmd, uint32_t index) {
     mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_HOST_READ_BIT;
     vkCmdPipelineBarrier2(cmd, &di);
 }
-void StatsQuery::gpu_dump(VkCommandBuffer cmd, const NvnState& s, uint64_t prog) {
+void StatsQuery::gpu_dump(VkCommandBuffer cmd, const NvnState& s, uint64_t prog, bool is_dispatch_dump) {
     std::lock_guard bl(stats_bind_mu);
     for (const GpuDumpRec& r : stats_gpu_recs)
         if (r.prog == prog) return;
@@ -3440,8 +3514,9 @@ void StatsQuery::gpu_dump(VkCommandBuffer cmd, const NvnState& s, uint64_t prog)
     VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
     vkCmdPipelineBarrier2(cmd, &di);
-    for (const int stage : {7, 6})
+    for (const int stage : {7, 6, 5})
         for (int i = 0; i < 16; i++) {
+            if ((stage == 5) != is_dispatch_dump) continue;   // (EvilOOT: a dispatch's own, stage 5)
             const nvn_p_bind_buf& b = s.ssbo[stage][i];
             if (!b.addr || !b.size || stats_gpu_recs.size() >= kGpuDumpSlots) continue;
             const uint32_t bytes = (uint32_t)std::min<uint64_t>(b.size, kGpuDumpSlot) & ~3u;
@@ -3617,6 +3692,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                               program_code_keys(s).c_str());
         SKIP_HERE();
     }
+    if (skip_live(cp->key)) return;   // (EvilOOT, RX_VK_SKIP_FILE)
     {   // (hookshot, RX_VK_SKIP_PROG: draws too, their native code keys logged once; =-: none. By default OoT's 53509044401d78d2, 128
         // draws of a full-screen pass over two 64^3 volumes, once, while the game loads: on about half the first starts the GPU stalled in
         // them for Windows' two seconds and the device was lost, a black screen with the frame counter over it. Its shaders are straight-line
@@ -4658,6 +4734,10 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     if (stats_dir()) watch_note_sb(p.key, s);   // (RX_VK_WATCH_SB)
     {
         StatsQuery stats_query(cmd, p.key, indirect, x, y, z);   // (EvilOOT, RX_VK_DRAW_STATS)
+        {   // (RX_VK_GPU_DUMP=1 with RX_VK_DRAW_STATS_PROGS: the wanted dispatches' storage buffers as the GPU holds them after)
+            static const bool gpu_dump_on = getenv("RX_VK_GPU_DUMP") != nullptr;
+            if (gpu_dump_on && stats_query.cmd && stats_prog_wanted(p.key)) stats_query.state = &s, stats_query.prog = p.key;
+        }
         if (indirect) {
             BufferRef args = gpu_buffer_bind(indirect, 12, false);
             if (!args) SKIP_HERE();

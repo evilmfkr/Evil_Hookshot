@@ -1131,7 +1131,15 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], ssbo_addr_pointer))};
             const Id ssbo_addr{OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask))};
             const Id ssbo_size{OpUConvert(U64, OpLoad(U32[1], ssbo_size_pointer))};
-            const Id ssbo_end{OpIAdd(U64, ssbo_addr, ssbo_size)};
+            Id ssbo_end{OpIAdd(U64, ssbo_addr, ssbo_size)};
+            // (EvilOOT) no further than what is bound: a buffer the back end could not bind is a null descriptor (length 0), and an
+            // address in its range read 0 through it instead of going on to the page table (OoT's ambient light probes: 0, the
+            // foliage and signs black)
+            if (Sirit::ValidId(struct_pointer_of(ssbo_member)) && Sirit::ValidId(ssbos[index].*ssbo_member)) {
+                const Id elements{OpArrayLength(U32[1], ssbos[index].*ssbo_member, 0U)};
+                const Id bound_end{OpIAdd(U64, ssbo_addr, OpUConvert(U64, OpShiftLeftLogical(U32[1], elements, Const(shift))))};
+                ssbo_end = OpSelect(U64, OpULessThan(U1, bound_end, ssbo_end), bound_end, ssbo_end);
+            }
             const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr),
                                        OpULessThan(U1, addr, ssbo_end))};
             const Id then_label{OpLabel()};
@@ -1168,7 +1176,10 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
                     const Id elements{OpArrayLength(U32[1], OpAccessChain(struct_pointer, table_id, Const(k)), 0U)};
                     const Id bound_end{
                         OpIAdd(U64, ssbo_addr, OpUConvert(U64, OpShiftLeftLogical(U32[1], elements, Const(shift))))};
-                    ssbo_end = OpSelect(U64, OpIEqual(U1, size_word, zero), bound_end, ssbo_end);
+                    // (EvilOOT: and an entry with a size no further than what is bound either: an entry the back end could
+                    // not bind (a whole pool past its imports) is a null descriptor, and its range read 0 instead of the page table)
+                    const Id capped{OpSelect(U64, OpULessThan(U1, bound_end, ssbo_end), bound_end, ssbo_end)};
+                    ssbo_end = OpSelect(U64, OpIEqual(U1, size_word, zero), bound_end, capped);
                 }
                 const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr), OpULessThan(U1, addr, ssbo_end))};
                 const Id then_label{OpLabel()};
