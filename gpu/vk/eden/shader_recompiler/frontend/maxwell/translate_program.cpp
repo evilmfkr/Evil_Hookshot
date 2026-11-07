@@ -190,7 +190,8 @@ void AddNVNStorageBuffers(IR::Program& program) {
     static const bool miss_log{std::getenv("RX_VK_MISS_LOG") != nullptr && std::atoi(std::getenv("RX_VK_MISS_LOG")) != 0};
     // (compute only: the driver crashed compiling a mesh program with it; and only the program vk_shader.cpp names when
     // RX_VK_MISS_LOG_PROG is set: Optimization::g_nvn2_miss_log_this)
-    if (miss_log && program.stage == Stage::Compute && Optimization::g_nvn2_miss_log_this) {
+    if (miss_log && (program.stage == Stage::Compute || program.stage == Stage::Mesh || program.stage == Stage::Task) &&
+        Optimization::g_nvn2_miss_log_this) {
         descs.push_back({
             .cbuf_index = driver_cbuf,
             .cbuf_offset = 0xff0U,

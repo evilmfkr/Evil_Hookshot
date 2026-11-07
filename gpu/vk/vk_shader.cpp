@@ -1165,6 +1165,12 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
                          const Code* fsc, const uint8_t color_types[8]) {
     const auto t0 = std::chrono::steady_clock::now();
     ptr_diag_reset();
+    {   // (EvilOOT, RX_VK_MISS_LOG_PROG=<key prefix>: the miss log for that program only)
+        static const char* only = getenv("RX_VK_MISS_LOG_PROG");
+        char hex[24];
+        snprintf(hex, sizeof hex, "%016llx", (unsigned long long)p.key);
+        Shader::Optimization::g_nvn2_miss_log_this = !only || !strncmp(hex, only, strlen(only));
+    }
     try {
         Shader::Backend::Bindings bindings{};
         std::vector<std::vector<uint32_t>> kept;   // (each stage's SPIR-V, for the program cache: mesh programs were never kept,

@@ -44,12 +44,13 @@ bool PointerDiagOn() {
     static const bool on = std::getenv("RX_VK_PTR_DIAG") != nullptr && std::atoi(std::getenv("RX_VK_PTR_DIAG")) != 0;
     return on;
 }
-/// (EvilOOT) RX_VK_PTR_SPLIT_FALLBACK=1, experiment: a split address (see PointerDiag) is not bound to the constant buffer
-/// pointer on one side of its select or phi; it is left to the run-time search, which finds whichever bound buffer (or table
-/// entry, or mesh pointer table region) the address really falls in
+/// (EvilOOT) a split address (see PointerDiag) is not bound to the constant buffer pointer on one side of its select or phi;
+/// it is left to the run-time search, which finds whichever bound buffer (or table entry, or pointer table pool) the
+/// address really falls in. #410's bug class (EvilOOT's near leaves): bound to one side, the other side's reads went to
+/// the wrong buffer. On by default since the search covers whole pools (OoT's culling: characters, fallen leaves and
+/// fireflies came back). RX_VK_PTR_SPLIT_FALLBACK=0: bound as before.
 bool SplitFallbackOn() {
-    static const bool on = std::getenv("RX_VK_PTR_SPLIT_FALLBACK") != nullptr &&
-                           std::atoi(std::getenv("RX_VK_PTR_SPLIT_FALLBACK")) != 0;
+    static const bool on = !std::getenv("RX_VK_PTR_SPLIT_FALLBACK") || std::atoi(std::getenv("RX_VK_PTR_SPLIT_FALLBACK")) != 0;
     return on;
 }
 /// Address in constant buffers to the storage buffer descriptor

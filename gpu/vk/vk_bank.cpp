@@ -239,7 +239,9 @@ const PointerEntry* pointer_table(const NvnState& s, int stage) {
     }
     std::sort(found, found + n);
     uint32_t regions = 0;
-    if (stage == 5) {   // (EvilOOT) compute: whole pools
+    if (stage == 5 || stage == 6 || stage == 7) {   // (EvilOOT) compute, task and mesh: whole pools
+        // (mesh programs too: once OoT's foliage draws were given work they read their instances through the same kind of
+        // pointers, and with 1 MB regions every primitive was clipped away: positions read as 0)
         // OoT's culling passes follow pointers found in their records into lists that hold more pointers, spread over one
         // ~100 MB pool: regions of 1 MB past the first pointers missed them, the reads gave 0 and every object was culled.
         // The pools that hold the pointers are bound whole (read by the shader's search; GPU-only, never copied back, as
