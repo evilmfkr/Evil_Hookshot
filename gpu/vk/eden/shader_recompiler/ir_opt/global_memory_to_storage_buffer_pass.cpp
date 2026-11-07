@@ -41,6 +41,7 @@ thread_local PointerDiag g_pointer_diag{};
 // (collect_shader_info_pass.cpp: NVN2 compute's storage buffer slots for the program translated on this thread, 0: not compute)
 extern thread_local u32 g_nvn2_compute_ssbo_base;
 extern thread_local u32 g_nvn2_compute_ssbo_count;
+extern thread_local bool g_all_global_this;   // (RX_VK_ALL_GLOBAL_PROGS, vk_shader.cpp: no access of this program bound)
 
 namespace {
 bool PointerDiagOn() {
@@ -586,6 +587,9 @@ thread_local bool g_follow_stage = false;   // (hookshot: the program being tran
 
 /// Collects the storage buffer used by a global memory instruction and the instruction itself
 void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) {
+    if (g_all_global_this) {
+        return;   // (EvilOOT, a test: every access left global, found by its address at run time: search, then the page table)
+    }
     // NVN puts storage buffers in a specific range, we have to bias towards these addresses to
     // avoid getting false positives
     static constexpr Bias nvn_bias{

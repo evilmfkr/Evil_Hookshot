@@ -57,6 +57,7 @@ extern thread_local uint32_t g_nvn2_compute_ssbo_base;
 extern thread_local uint32_t g_nvn2_compute_ssbo_count;
 extern thread_local uint32_t g_nvn2_compute_layout_end;
 extern thread_local bool g_nvn2_miss_log_this;
+extern thread_local bool g_all_global_this;
 }
 namespace mkwvk {
 struct NvnState;
@@ -1018,11 +1019,23 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                 char hex[24];
                 snprintf(hex, sizeof hex, "%016llx", (unsigned long long)p.key);
                 Shader::Optimization::g_nvn2_miss_log_this = !only || !strncmp(hex, only, strlen(only));
+                // (RX_VK_ALL_GLOBAL_PROGS=<key prefix>[,...], a test: no access of those programs bound to a descriptor)
+                bool all_global = false;
+                if (const char* ag = getenv("RX_VK_ALL_GLOBAL_PROGS"))
+                    for (const char* q = ag; *q;) {
+                        const char* e = strchr(q, ',');
+                        const size_t len = e ? (size_t)(e - q) : strlen(q);
+                        if (len && !strncmp(hex, q, len)) all_global = true;
+                        q = e ? e + 1 : q + len;
+                    }
+                Shader::Optimization::g_all_global_this = all_global;
+                if (all_global) logf("vk: program %s: every memory access left global (RX_VK_ALL_GLOBAL_PROGS)", hex);
             }
             struct ResetTable {
                 ~ResetTable() {
                     Shader::Optimization::g_nvn2_compute_ssbo_base = 0, Shader::Optimization::g_nvn2_compute_ssbo_count = 16;
                     Shader::Optimization::g_nvn2_compute_layout_end = 0;
+                    Shader::Optimization::g_all_global_this = false;
                 }
             } reset_table;
             auto t = translate(env, false);

@@ -984,7 +984,14 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     static const bool no_follow{getenv("RX_VK_NO_FOLLOW") != nullptr};
     // (RX_VK_FOLLOW_MESH=1: the task and mesh stages too. Tried for the foliage, which it did not bring back: off)
     static const bool no_mesh{getenv("RX_VK_FOLLOW_MESH") == nullptr};
-    const bool follow_pointers{(stage == Stage::Compute || (!no_mesh && (stage == Stage::Task || stage == Stage::Mesh))) && !no_follow};
+    // (EvilOOT: vertex and fragment stages too, as the fallback only: an access no bound buffer holds read 0 there (Kokiri's
+    // pond came out grey, not green). The pointer pass leaves graphics stages as they were, so what was found before still is,
+    // and the menus' text stays. Not where the stage has the render area's push block: a stage has one push block.
+    // RX_VK_FOLLOW_GRAPHICS=0: off)
+    static const bool graphics{!getenv("RX_VK_FOLLOW_GRAPHICS") || atoi(getenv("RX_VK_FOLLOW_GRAPHICS")) != 0};
+    const bool graphics_stage{stage == Stage::VertexB || stage == Stage::Fragment};
+    const bool follow_pointers{(stage == Stage::Compute || (!no_mesh && (stage == Stage::Task || stage == Stage::Mesh)) ||
+                                (graphics && graphics_stage && !info.uses_render_area)) && !no_follow};
     Id ptr_u64{};
     if (follow_pointers) {
         wants_guest_pages = true;
