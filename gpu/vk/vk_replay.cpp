@@ -875,11 +875,11 @@ void maybe_split(VkCommandBuffer& cmd) {
 }
 
 // ---- parallel replay: the threads and a command buffer's segments ----
-// (RX_VK_PARALLEL=<threads recording a command buffer, the replay thread one of them>; 0, 1: off. 3 by default: in a
-// Grand Prix race 58-59 fps against 46-49 on the replay thread alone, the game's GPU waits 0.3 s in 5 s against 1.9;
-// it was slower while textures were evicted and made again every 10 frames)
+// (RX_VK_PARALLEL=<threads recording a command buffer, the replay thread one of them>; 0, 1: off, the default. Segments
+// recorded out of order left one-frame black scenes in play, 48-93 in a walk through Kakariko against none on the
+// replay thread alone, at about the same frame rate here: 36-40 fps against 38-41)
 int par_threads() {
-    static const int n = std::clamp(getenv("RX_VK_PARALLEL") ? atoi(getenv("RX_VK_PARALLEL")) : 3, 0, 8);
+    static const int n = std::clamp(getenv("RX_VK_PARALLEL") ? atoi(getenv("RX_VK_PARALLEL")) : 0, 0, 8);
     return n;
 }
 struct ParPool {
@@ -1918,6 +1918,11 @@ void log_frame_stats() {
 
 uint64_t present_value = 0;   // (the present job's value, handed out as it came; 0: the next one)
 void do_present(const nvn_tex* t, const int crop[4]) {
+    {   // (hookshot, RX_VK_PASS_TRACE_AT=<frames>: the passes of the frames around these frame numbers, for finding what a frame is made of)
+        static std::atomic<int64_t> seen{0};
+        static const int64_t at = getenv("RX_VK_PASS_TRACE_AT") ? atoll(getenv("RX_VK_PASS_TRACE_AT")) : 0;
+        if (at && ++seen % at == 0) pass_traces_log(texture_frame_no() - 1, texture_frame_no());
+    }
     static const char* shots = getenv("RX_VK_SHOTS");
     static const int shot_every = getenv("RX_VK_SHOT_EVERY") ? std::max(1, atoi(getenv("RX_VK_SHOT_EVERY"))) : 300;
     VkImage src = VK_NULL_HANDLE;
@@ -2383,7 +2388,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     VkImage dst = dev.swap_images[index];
     full_barrier(f.cmd);   // (after the game's work for the frame: earlier submits on this queue)
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    if (const VkImage scaled = src && view ? framegen_scale(f.cmd, view, dev.swap_extent.width, dev.swap_extent.height) : VK_NULL_HANDLE) {
+    if (const VkImage scaled = src && view ? framegen_scale(f.cmd, view, src, sw, sh, crop, dev.swap_extent.width, dev.swap_extent.height) : VK_NULL_HANDLE) {
         blit_crop(f.cmd, scaled, dev.swap_extent.width, dev.swap_extent.height, nullptr, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                   dev.swap_extent.width, dev.swap_extent.height);
     } else if (src) {

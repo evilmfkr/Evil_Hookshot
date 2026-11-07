@@ -33,6 +33,7 @@ int hos_mouse_take(int32_t *dx, int32_t *dy) {
     return mouse_captured;
 }
 
+static HANDLE renderer_up;
 static int fullscreen;
 static WINDOWPLACEMENT windowed_place;
 
@@ -111,6 +112,9 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) mouse_capture(w, 0);
         if (wp == VK_F11 && !(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
+        return 0;
+    case WM_APP + 7:   /* (the Insert menu's row) */
+        set_fullscreen(w, (int)wp);
         return 0;
     case WM_DPICHANGED:
         if (!fullscreen) {
@@ -198,6 +202,7 @@ static DWORD WINAPI display_main(void *p) {
     RegisterRawInputDevices(&rid, 1, sizeof rid);
     renderer = rx_start(hwnd);
     if (!renderer) hos_log("display: no WebGPU device: the window stays black");
+    SetEvent(renderer_up);
     SetTimer(hwnd, 1, 250, NULL);
     MSG m;
     while (GetMessageA(&m, NULL, 0, 0) > 0) {
@@ -207,10 +212,18 @@ static DWORD WINAPI display_main(void *p) {
     return 0;
 }
 
+/* (hookshot) The game's first work for the GPU waits for the renderer. It ran beside the renderer's start, and what it submitted while the
+   shaders were being prepared (80 s on a first start) was lost: that run had no ambient light, black foliage and dark characters. The
+   game itself goes on starting as it did: held at the start instead, it left holes in the ground */
+void hos_renderer_wait(void) {
+    if (renderer_up) WaitForSingleObject(renderer_up, INFINITE);
+}
+
 void hos_display_start(void) {
     if (getenv("HOS_HEADLESS")) {   /* no window: the renderer still draws, offscreen (screenshots, frame dumps) */
         rx_start(NULL);
         return;
     }
+    renderer_up = CreateEventA(NULL, TRUE, FALSE, NULL);
     CreateThread(NULL, 0, display_main, NULL, 0, NULL);
 }

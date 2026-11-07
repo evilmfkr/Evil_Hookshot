@@ -311,10 +311,11 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     std::vector<VkPresentModeKHR> modes(n);
     vkGetPhysicalDeviceSurfacePresentModesKHR(dev.physical, dev.surface, &n, modes.data());
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    for (auto m : modes)   // (RX_VK_FIFO=1: as on a card or driver with vsync forced, or no mailbox)
+        if (m == VK_PRESENT_MODE_MAILBOX_KHR && !getenv("RX_VK_FIFO")) mode = m;
+    // (hookshot) no mailbox (AMD's Windows driver has none): immediate before FIFO, which held anything under 60 fps to 30 (40 fps became 30 here)
     for (auto m : modes)
-        if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;
-    for (auto m : modes)
-        if (m == VK_PRESENT_MODE_IMMEDIATE_KHR && getenv("RX_VK_IMMEDIATE")) mode = m;
+        if (m == VK_PRESENT_MODE_IMMEDIATE_KHR && (getenv("RX_VK_IMMEDIATE") || mode == VK_PRESENT_MODE_FIFO_KHR) && !getenv("RX_VK_FIFO")) mode = m;
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = dev.surface;
     ci.minImageCount = std::max(caps.minImageCount, 4u);   // (hookshot: mailbox with frame interpolation: an image always free)
@@ -351,6 +352,7 @@ namespace {
 
 HWND main_window = nullptr;
 bool started_up() {
+    if (const char* e = getenv("RX_VK_START_DELAY")) Sleep((DWORD)atoi(e) * 1000);   // (diagnosis: a long start, as the first one is)
     if (!replay_start()) return false;
     if (precompile_wanted()) {   // (a release build, before the game: nothing to build during play)
         // (a console while it lasts: there is no window yet, and a long wait with nothing on screen looks like a hang)
@@ -438,3 +440,7 @@ extern "C" __declspec(dllexport) const MkwVkRenderer* mkwvk_init(const MkwVkHost
     fill_replay_table(table);
     return &table;
 }
+
+namespace mkwvk {
+HWND app_window() { return main_window; }   // (hookshot: the Insert menu's Fullscreen row)
+} // namespace mkwvk
