@@ -76,7 +76,14 @@ const Switches& sw() {
 }
 
 // (EvilOOT, RX_VK_DRAW_STATS) the storage buffers bound in the measured frame, with their programs: who writes what
-struct StatsBind { uint64_t prog, addr, size; int stage; bool written, table; uint32_t cbuf = 0, off = 0; uint64_t raw = 0; };
+struct StatsBind {
+    uint64_t prog, addr, size;
+    int stage;
+    bool written, table;
+    uint32_t cbuf = 0, off = 0;
+    uint64_t raw = 0;
+    uint64_t vkbuf = 0, vkoff = 0;   // (the Vulkan buffer and offset the binding resolved to: two pools over one range show here)
+};
 std::mutex stats_bind_mu;
 std::vector<StatsBind> stats_binds;
 // (and the GPU addresses the small storage buffers of each dispatch hold: pointers its program may follow)
@@ -85,6 +92,13 @@ std::vector<StatsPtr> stats_ptrs;
 std::vector<StatsPtr> stats_ptrs2;   // (second level: in the pointer table's regions, covered by nothing the dispatch has)
 // (RX_VK_DRAW_STATS_PROGS: those programs' uniform and storage buffers as the dispatch saw them, hex, once each)
 std::vector<std::string> stats_dumps;
+// (and as the GPU held them after the wanted draws: 32 slots of up to 1 MB each; StatsQuery::gpu_dump)
+constexpr uint32_t kGpuDumpSlot = 1u << 20, kGpuDumpSlots = 32;
+VkBuffer stats_gpu = VK_NULL_HANDLE;
+VmaAllocation stats_gpu_mem = nullptr;
+uint8_t* stats_gpu_map = nullptr;
+struct GpuDumpRec { uint64_t prog, addr; uint32_t slot, bytes; int stage, index; };
+std::vector<GpuDumpRec> stats_gpu_recs;
 // (RX_VK_MISS_LOG=1: each program's slice of one host-visible buffer, its c0+0xff0 descriptor: the global memory
 // accesses no binding held, counted, the first 63 addresses kept; translate_program.cpp, spirv_emit_context.cpp)
 constexpr uint32_t kMissSlice = 512, kMissSlices = 4096;
@@ -109,6 +123,42 @@ VkDescriptorBufferInfo miss_binding(uint64_t prog) {
     }
     return {miss_buf, (VkDeviceSize)it->second * kMissSlice, kMissSlice};
 }
+/// (RX_VK_DRAW_STATS_PROGS) a stage's uniform and storage buffers as recorded, hex (first 1 KB each), once per program
+void stats_dump_stage(uint64_t prog, const NvnState& s, int stage) {
+    static std::mutex dm;
+    static std::unordered_set<uint64_t> done;
+    {
+        std::lock_guard lk(dm);
+        if (!done.insert(prog ^ ((uint64_t)stage << 56)).second) return;
+    }
+    const auto dump = [&](const char* kind, int slot, const nvn_p_bind_buf& b) {
+        if (!b.addr || !b.size) return;
+        const uint64_t n = std::min<uint64_t>(b.size, 0x400) & ~15ull;
+        std::vector<uint32_t> w(n / 4);
+        if (w.empty() || !memory_read_as_submitted(b.addr, w.data(), n)) return;
+        uint64_t nonzero = 0, total = 0;   // (over the whole binding, up to 16 MB: is anything in it at all)
+        {
+            const uint64_t all = std::min<uint64_t>(b.size, 16ull << 20) & ~3ull;
+            std::vector<uint32_t> big(all / 4);
+            if (!big.empty() && memory_read_as_submitted(b.addr, big.data(), all))
+                for (const uint32_t v : big) nonzero += v != 0, total++;
+        }
+        std::string text;
+        char line[200];
+        snprintf(line, sizeof line, "%016llx s%d %s%d at %#llx size %#llx (game memory: %llu of %llu words non-zero):\n",
+                 (unsigned long long)prog, stage, kind, slot, (unsigned long long)b.addr, (unsigned long long)b.size,
+                 (unsigned long long)nonzero, (unsigned long long)total);
+        text += line;
+        for (size_t i = 0; i < w.size(); i += 4) {
+            snprintf(line, sizeof line, "  +%03zx: %08x %08x %08x %08x\n", i * 4, w[i], w[i + 1], w[i + 2], w[i + 3]);
+            text += line;
+        }
+        std::lock_guard bl(stats_bind_mu);
+        if (stats_dumps.size() < 256) stats_dumps.push_back(text);
+    };
+    for (int i = 0; i < 16; i++) dump("ubo", i, s.ubo[stage][i]);
+    for (int i = 0; i < 16; i++) dump("ssbo", i, s.ssbo[stage][i]);
+}
 bool stats_prog_wanted(uint64_t key) {
     static const std::vector<uint64_t> want = [] {
         std::vector<uint64_t> v;
@@ -125,10 +175,10 @@ bool stats_prog_wanted(uint64_t key) {
 }
 bool stats_frame_now();   // (below: the frame being measured is the current one)
 void stats_note_bind(uint64_t prog, int stage, uint64_t addr, uint64_t size, bool written, bool table, uint32_t cbuf = 0,
-                     uint32_t off = 0, uint64_t raw = 0) {
+                     uint32_t off = 0, uint64_t raw = 0, uint64_t vkbuf = 0, uint64_t vkoff = 0) {
     if (!stats_frame_now()) return;
     std::lock_guard lk(stats_bind_mu);
-    if (stats_binds.size() < 200000) stats_binds.push_back({prog, addr, size, stage, written, table, cbuf, off, raw});
+    if (stats_binds.size() < 200000) stats_binds.push_back({prog, addr, size, stage, written, table, cbuf, off, raw, vkbuf, vkoff});
 }
 
 /// The recording being built (each recording thread's own)
@@ -1404,6 +1454,14 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 // end are whatever the constant buffer holds there, bound only when they look like a buffer
                 const bool plausible = d.count == 1 || (size && size <= (256ull << 20) && host->gpu_guest(base));
                 BufferRef b = addr && plausible ? gpu_buffer_bind(base, n, d.is_written && !bare) : BufferRef{};
+                // (EvilOOT) a bare entry the program writes through: its first 64 bytes marked written (the same mirror), so
+                // the counts and records the culling setup writes there survive the mirror's syncs from guest memory and go
+                // back to it, as on the console; the rest of the guessed 1 MB stays the GPU's (copied back whole, it
+                // overwrote the CPU's own data beside it)
+                if (b && bare && d.is_written && d.cbuf_offset != 0x880) {
+                    const uint64_t head = std::min<uint64_t>(n, (addr - base) + 0x40);
+                    (void)gpu_buffer_bind(base, (head + 3) & ~3ull, true);
+                }
                 if (b && wide_n) {   // (the same buffer, its binding longer, nothing more marked written)
                     const BufferRef w = gpu_buffer_bind(base, wide_n, false);
                     if (w && w.buffer == b.buffer && w.offset == b.offset) b = w, n = wide_n;
@@ -1411,7 +1469,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 // (census: every single descriptor, and table entries that hold something, with where they came from)
                 if (d.count == 1 || addr)
                     stats_note_bind(p.key, ns, addr && plausible ? base : 0, addr && plausible ? n : size, d.is_written, d.count > 1,
-                                    d.cbuf_index, off, addr);
+                                    d.cbuf_index, off, addr, (uint64_t)(uintptr_t)b.buffer, b.offset);
                 if (d.count > 1) {   // (hookshot) a table entry bound one frame and not the next (or back), 60 of them
                     static std::mutex tm;
                     static std::unordered_map<uint64_t, std::pair<bool, uint64_t>> was;   // -> bound, its address
@@ -2822,6 +2880,7 @@ struct StatsMeta {
     uint32_t guest[4], guest_count;   // (the same words as the game's memory held them when the draw was recorded)
     uint8_t dispatch;                 // (a compute dispatch: its grid, or its indirect arguments as above)
     uint32_t grid[3];
+    uint64_t args_vkbuf, args_vkoff;  // (the Vulkan buffer and offset the arguments were read from)
 };
 VkQueryPool stats_pool = VK_NULL_HANDLE;
 // (indirect draws: after the draw, the first 16 bytes of its arguments and its count word as the GPU holds them, 32 bytes a
@@ -2901,6 +2960,7 @@ void stats_tick() {
             stats_ptrs.clear();
             stats_ptrs2.clear();
             stats_dumps.clear();
+            stats_gpu_recs.clear();
         }
         {
             std::lock_guard ml(miss_mu);   // (the misses from here on: older frames' in-flight work may still add some)
@@ -3008,6 +3068,17 @@ void stats_tick() {
         {
             std::lock_guard bl(stats_bind_mu);
             for (const std::string& d : stats_dumps) fprintf(f, "\n%s", d.c_str());
+            for (const GpuDumpRec& r : stats_gpu_recs) {   // (as the GPU held them after the wanted draws)
+                if (!stats_gpu_map) break;
+                const uint32_t* w = (const uint32_t*)(stats_gpu_map + (size_t)r.slot * kGpuDumpSlot);
+                uint64_t nonzero = 0;
+                for (uint32_t i = 0; i < r.bytes / 4; i++) nonzero += w[i] != 0;
+                fprintf(f, "\n%016llx s%d ssbo%d at %#llx AS THE GPU HELD IT after the draw (%llu of %u words non-zero):\n",
+                        (unsigned long long)r.prog, r.stage, r.index, (unsigned long long)r.addr, (unsigned long long)nonzero,
+                        r.bytes / 4);
+                for (uint32_t i = 0; i + 4 <= r.bytes / 4 && i < 96; i += 4)
+                    fprintf(f, "  +%03x: %08x %08x %08x %08x\n", i * 4, w[i], w[i + 1], w[i + 2], w[i + 3]);
+            }
         }
         // (second level) pointers found in compute programs' pointer table regions that no binding or region of theirs covers
         {
@@ -3077,12 +3148,16 @@ void stats_tick() {
                 const std::pair<uint64_t, bool> k{b.prog, b.written};
                 if (std::find(seen.begin(), seen.end(), k) != seen.end()) continue;
                 seen.push_back(k);
-                char t[96];
-                snprintf(t, sizeof t, " %s%016llx@s%d[%#llx+%#llx]%s", b.written ? "W:" : "r:", (unsigned long long)b.prog, b.stage,
-                         (unsigned long long)b.addr, (unsigned long long)b.size, b.table ? "(table)" : "");
-                if (who.size() < 1500) who += t;
+                char t[160];
+                // (vk: the Vulkan buffer and the offset in it this binding gives the argument words; the read's own after the
+                // list: different ones mean two copies of the same memory)
+                snprintf(t, sizeof t, " %s%016llx@s%d[%#llx+%#llx]%s vk %llx+%#llx", b.written ? "W:" : "r:", (unsigned long long)b.prog,
+                         b.stage, (unsigned long long)b.addr, (unsigned long long)b.size, b.table ? "(table)" : "",
+                         (unsigned long long)b.vkbuf, (unsigned long long)(b.vkoff + (m.args_addr - b.addr)));
+                if (who.size() < 3000) who += t;
             }
-            fprintf(f, "args %#llx (draw prog %016llx):%s\n", (unsigned long long)m.args_addr, (unsigned long long)m.prog,
+            fprintf(f, "args %#llx (draw prog %016llx, read from vk %llx+%#llx):%s\n", (unsigned long long)m.args_addr,
+                    (unsigned long long)m.prog, (unsigned long long)m.args_vkbuf, (unsigned long long)m.args_vkoff,
                     who.empty() ? " NO BINDING HOLDS THEM" : who.c_str());
             // (and the dispatches whose small buffers hold a pointer into the buffer around them: 1 MB either side)
             std::string ptr_who;
@@ -3124,7 +3199,7 @@ struct StatsQuery {
         const uint32_t i = stats_used.fetch_add(1);
         if (i >= kStatsQueries) return;
         stats_meta[i] = {prog, (uint8_t)d.mesh, (uint8_t)(d.indirect != 0), (uint8_t)d.indexed, 0, d.count, d.instances, d.max,
-                         d.stride, d.count_addr, d.indirect, {}, 0, (uint8_t)dispatch, {}};
+                         d.stride, d.count_addr, d.indirect, {}, 0, (uint8_t)dispatch, {}, 0, 0};
         if (grid) std::memcpy(stats_meta[i].grid, grid, sizeof stats_meta[i].grid);
         if (d.indirect) {
             host->gpu_read(d.indirect, stats_meta[i].guest, dispatch ? 12 : 16);
@@ -3137,18 +3212,62 @@ struct StatsQuery {
         cmd = c, index = i;
     }
     bool is_dispatch = false;
+    const NvnState* state = nullptr;   // (a wanted draw: its mesh stage's storage buffers copied from the GPU after it)
+    uint64_t prog = 0;
     ~StatsQuery() {
         if (!cmd) return;
         vkCmdEndQuery(cmd, stats_pool, index);
         if (!is_dispatch) copy_args(cmd, *draw, index);   // (a dispatch's were copied before it ran: begin)
+        if (state && !is_dispatch) gpu_dump(cmd, *state, prog);
     }
-    /// The arguments as the GPU holds them: copied outside the pass, which the next draw opens again, as RX_VK_DUMP_EACH
-    /// does. A dispatch's before the dispatch (what it launched with: it may reset them itself), a draw's after it.
-    static void copy_args(VkCommandBuffer cmd, const DrawArgs& d, uint32_t index) {
+    /// (RX_VK_DRAW_STATS_PROGS) the first 1 KB of each storage buffer of the mesh stage, as the GPU holds it after the draw,
+    /// once per program: into stats_gpu (host-visible), printed with the report beside the memory view
+    static void gpu_dump(VkCommandBuffer cmd, const NvnState& s, uint64_t prog);
+    static void copy_args(VkCommandBuffer cmd, const DrawArgs& d, uint32_t index);
+};
+void StatsQuery::gpu_dump(VkCommandBuffer cmd, const NvnState& s, uint64_t prog) {
+    std::lock_guard bl(stats_bind_mu);
+    for (const GpuDumpRec& r : stats_gpu_recs)
+        if (r.prog == prog) return;
+    if (!stats_gpu) {
+        void* m = nullptr;
+        if (!create_buffer((uint64_t)kGpuDumpSlot * kGpuDumpSlots, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, stats_gpu, stats_gpu_mem, &m))
+            return;
+        stats_gpu_map = (uint8_t*)m;
+    }
+    end_pass(cmd);
+    VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+    vkCmdPipelineBarrier2(cmd, &di);
+    for (const int stage : {7, 6})
+        for (int i = 0; i < 16; i++) {
+            const nvn_p_bind_buf& b = s.ssbo[stage][i];
+            if (!b.addr || !b.size || stats_gpu_recs.size() >= kGpuDumpSlots) continue;
+            const uint32_t bytes = (uint32_t)std::min<uint64_t>(b.size, kGpuDumpSlot) & ~3u;
+            const BufferRef r = gpu_buffer_bind(b.addr, bytes, false);
+            if (!r) continue;
+            const uint32_t slot = (uint32_t)stats_gpu_recs.size();
+            VkBufferCopy c{r.offset, (VkDeviceSize)slot * kGpuDumpSlot, bytes};
+            vkCmdCopyBuffer(cmd, r.buffer, stats_gpu, 1, &c);
+            stats_gpu_recs.push_back({prog, b.addr, slot, bytes, stage, i});
+        }
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_HOST_READ_BIT;
+    vkCmdPipelineBarrier2(cmd, &di);
+}
+/// The arguments as the GPU holds them: copied outside the pass, which the next draw opens again, as RX_VK_DUMP_EACH
+/// does. A dispatch's before the dispatch (what it launched with: it may reset them itself), a draw's after it.
+void StatsQuery::copy_args(VkCommandBuffer cmd, const DrawArgs& d, uint32_t index) {
+    {
         if (!d.indirect || !stats_args) return;
         const BufferRef args = gpu_buffer_bind(d.indirect, 16, false);
         const BufferRef cnt = d.count_addr ? gpu_buffer_bind(d.count_addr, 4, false) : BufferRef{};
         if (!args) return;
+        stats_meta[index].args_vkbuf = (uint64_t)(uintptr_t)args.buffer, stats_meta[index].args_vkoff = args.offset;
         end_pass(cmd);
         VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
         mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -3170,7 +3289,7 @@ struct StatsQuery {
         vkCmdPipelineBarrier2(cmd, &di);
         stats_meta[index].args_read = 1;
     }
-};
+}
 } // namespace
 
 // ---- (EvilOOT) NVN2's indirect mesh draws in Vulkan's layout ----
@@ -3532,6 +3651,13 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         }
     }
     StatsQuery stats_query(cmd, p.key, d);   // (EvilOOT, RX_VK_DRAW_STATS)
+    if (stats_frame_now() && stats_prog_wanted(p.key)) {   // (and the wanted programs' buffers: a mesh draw's stages, fragment)
+        for (const int stage : {6, 7, 1}) stats_dump_stage(p.key, s, stage);
+        // (and as the GPU holds them, after it: RX_VK_GPU_DUMP=1 only; its bindings can sync a pool's mirror mid-frame, and
+        // the culling chain then measured as broken)
+        static const bool gpu_dump_on = getenv("RX_VK_GPU_DUMP") != nullptr;
+        if (stats_query.cmd && gpu_dump_on) stats_query.state = &s, stats_query.prog = p.key;
+    }
     if (d.mesh) {
         {   // (RX_VK_LOG_MESH_DRAWS=1: how large each is, the largest so far, 400 lines)
             static const bool log_sizes = getenv("RX_VK_LOG_MESH_DRAWS") != nullptr;
@@ -4314,27 +4440,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                         stats_ptrs2.push_back({p.key, e[i].addr, v});
             }
         }
-        if (stats_prog_wanted(p.key)) {
-            const auto dump = [&](const char* kind, int slot, const nvn_p_bind_buf& b) {
-                if (!b.addr || !b.size) return;
-                const uint64_t n = std::min<uint64_t>(b.size, 0x400) & ~15ull;
-                std::vector<uint32_t> w(n / 4);
-                if (w.empty() || !memory_read_as_submitted(b.addr, w.data(), n)) return;
-                std::string text;
-                char line[160];
-                snprintf(line, sizeof line, "%016llx %s%d at %#llx size %#llx:\n", (unsigned long long)p.key, kind, slot,
-                         (unsigned long long)b.addr, (unsigned long long)b.size);
-                text += line;
-                for (size_t i = 0; i < w.size(); i += 4) {
-                    snprintf(line, sizeof line, "  +%03zx: %08x %08x %08x %08x\n", i * 4, w[i], w[i + 1], w[i + 2], w[i + 3]);
-                    text += line;
-                }
-                std::lock_guard bl(stats_bind_mu);
-                if (stats_dumps.size() < 64) stats_dumps.push_back(text);
-            };
-            for (int i = 0; i < 16; i++) dump("ubo", i, s.ubo[5][i]);
-            for (int i = 0; i < 16; i++) dump("ssbo", i, s.ssbo[5][i]);
-        }
+        if (stats_prog_wanted(p.key)) stats_dump_stage(p.key, s, 5);   // (with each buffer's non-zero words)
     }
     {
         StatsQuery stats_query(cmd, p.key, indirect, x, y, z);   // (EvilOOT, RX_VK_DRAW_STATS)
