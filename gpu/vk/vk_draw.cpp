@@ -1437,7 +1437,9 @@ void build_descriptors(const NvnState& s, const Program& p) {
                     }
                     if (bank >= 3 && bank < 3 + 16) {
                         const nvn_p_bind_buf& u = s.ubo[std::clamp(ns, 0, kNvnStages - 1)][bank - 3];
-                        if (u.addr && (!u.size || o + 4 <= u.size)) memory_read_as_submitted(u.addr + o, &v, 4);
+                        // (with the stream's inline uniform updates before this place over it, ub_read: a table word the
+                        // game writes with nvnCommandBufferUpdateUniformBuffer is not in guest memory at all)
+                        if (u.addr && (!u.size || o + 4 <= u.size) && !ub_read(u.addr + o, &v, 4)) v = 0;
                     }
                     return v;
                 };
@@ -1483,9 +1485,14 @@ void build_descriptors(const NvnState& s, const Program& p) {
                     if (w && w.buffer == b.buffer && w.offset == b.offset) b = w, n = wide_n;
                 }
                 // (census: every single descriptor, and table entries that hold something, with where they came from)
-                if (d.count == 1 || addr)
-                    stats_note_bind(p.key, ns, addr && plausible ? base : 0, addr && plausible ? n : size, d.is_written, d.count > 1,
-                                    d.cbuf_index, off, addr, (uint64_t)(uintptr_t)b.buffer, b.offset);
+                if (d.count == 1 || addr) {
+                    // (unresolved: the uniform buffer the word was read from, its address and size, in the vk fields)
+                    const nvn_p_bind_buf* ub = d.cbuf_index >= 3 && d.cbuf_index < 3 + 16
+                                                   ? &s.ubo[std::clamp(ns, 0, kNvnStages - 1)][d.cbuf_index - 3] : nullptr;
+                    const bool none = !(addr && plausible);
+                    stats_note_bind(p.key, ns, none ? 0 : base, none ? size : n, d.is_written, d.count > 1, d.cbuf_index, off, addr,
+                                    none && ub ? ub->addr : (uint64_t)(uintptr_t)b.buffer, none && ub ? ub->size : b.offset);
+                }
                 if (d.count > 1) {   // (hookshot) a table entry bound one frame and not the next (or back), 60 of them
                     static std::mutex tm;
                     static std::unordered_map<uint64_t, std::pair<bool, uint64_t>> was;   // -> bound, its address
@@ -3147,13 +3154,18 @@ void stats_tick() {
         // (census) single storage buffer descriptors that resolved to nothing in this frame, by program and slot: a shader
         // that reads or writes a buffer it was never given. Empty table entries are left out (tables have holes).
         {
-            std::map<std::tuple<uint64_t, int, uint32_t, uint32_t>, std::pair<uint64_t, bool>> unresolved;   // -> raw, written
-            for (const StatsBind& b : binds)
-                if (!b.table && !b.addr) unresolved[{b.prog, b.stage, b.cbuf, b.off}] = {b.raw, b.written};
+            std::map<std::tuple<uint64_t, int, uint32_t, uint32_t>, std::tuple<uint64_t, bool, uint64_t, uint64_t, int>> unresolved;
+            for (const StatsBind& b : binds)   // (-> raw, written, the uniform buffer's address and size, times seen)
+                if (!b.table && !b.addr) {
+                    auto& e = unresolved[{b.prog, b.stage, b.cbuf, b.off}];
+                    e = {b.raw, b.written, b.vkbuf, b.vkoff, std::get<4>(e) + 1};
+                }
             fprintf(f, "\n# unresolved single descriptors: %zu\n", unresolved.size());
             for (const auto& [k, v] : unresolved)
-                fprintf(f, "  %016llx s%d c%u+%#x raw %#llx %s\n", (unsigned long long)std::get<0>(k), std::get<1>(k), std::get<2>(k),
-                        std::get<3>(k), (unsigned long long)v.first, v.second ? "WRITTEN" : "read");
+                fprintf(f, "  %016llx s%d c%u+%#x raw %#llx %s (x%d; from the uniform buffer at %#llx size %#llx)\n",
+                        (unsigned long long)std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k),
+                        (unsigned long long)std::get<0>(v), std::get<1>(v) ? "WRITTEN" : "read", std::get<4>(v),
+                        (unsigned long long)std::get<2>(v), (unsigned long long)std::get<3>(v));
         }
         fprintf(f, "\n# indirect arguments: the storage buffers of this frame that hold them (%zu bindings noted)\n", binds.size());
         std::vector<uint64_t> done;
