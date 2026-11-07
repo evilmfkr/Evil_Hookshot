@@ -22,6 +22,19 @@
   <a href="#license">License</a>
 </p>
 
+> [!NOTE]
+> **This is EvilBoyce's fork of Hookshot** (Discord: **evilmfkr**), kept up to date with upstream
+> ([NotRexed/Hookshot](https://github.com/NotRexed/Hookshot)). Its own fixes, aimed at Kokiri Forest looking as it does on
+> the console:
+> - **Foliage:** the GPU culling of trees, ferns, grass, falling leaves and fireflies (storage buffer tables in the game's
+>   own constant buffers, bare table entries, NVN2 compute's buffer slots, indirect mesh records).
+> - **Lighting:** the ambient light probes (signs, plants and Link were black in the shade), the pond's water, and the
+>   game's own fog without the old fog/exposure workaround.
+> - **Stability:** the freeze after loading a save (Horizon's mutex handoff), GPU data kept across memory pool changes.
+> - **Tools:** per-draw GPU statistics, a hang watchdog, live bisection and memory watches for finding rendering bugs.
+>
+> Each change is explained in its commit message (branch `Evil`; the earlier ones are signed EvilOOT).
+
 Hookshot is a static recompilation. The game's code is translated to C and compiled into a Windows program, the
 console's system software is reimplemented, and the Switch 2 graphics are rebuilt on Vulkan. All of this happens
 **on your PC, from your own copy of the game**.
@@ -167,6 +180,8 @@ Bigger ways to help:
 Hookshot exists thanks to the work of many people:
 
 - **NotRexed**: Hookshot, BlueShell (Mario Kart World), Skybound (Tears of the Kingdom) and the a64-kit tools.
+- **EvilBoyce** (Discord: evilmfkr): this fork: the foliage culling, ambient light, water and fog fixes, the freeze after Load, and the
+  rendering diagnostics tools.
 - **[Eden](https://git.eden-emu.dev/eden-emu/eden)** and **Eglantine**: the shader recompiler and Switch 2 shader work.
 - **suyu**: the graphics decoders and the AArch64 translator.
 - **[seedds/nxnative](https://github.com/seedds/nxnative)**: reference for how task and mesh shaders work.
