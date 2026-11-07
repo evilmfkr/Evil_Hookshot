@@ -127,8 +127,11 @@ VkDescriptorBufferInfo miss_binding(uint64_t prog) {
 void stats_dump_stage(uint64_t prog, const NvnState& s, int stage) {
     static std::mutex dm;
     static std::unordered_set<uint64_t> done;
+    static int64_t done_frame = -1;   // (once per program per measured frame)
     {
         std::lock_guard lk(dm);
+        const int64_t f = (int64_t)texture_frame_no();
+        if (f != done_frame) done.clear(), done_frame = f;
         if (!done.insert(prog ^ ((uint64_t)stage << 56)).second) return;
     }
     const auto dump = [&](const char* kind, int slot, const nvn_p_bind_buf& b) {
