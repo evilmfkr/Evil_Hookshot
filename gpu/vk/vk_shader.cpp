@@ -759,7 +759,10 @@ void dump_ir(const Program& p, const char* stage, const Shader::IR::Program& pro
 /// Translates a program variant's stages into p (on a worker for graphics programs: s and the codes are copies)
 // (hookshot) ir_opt/oot_visual_workaround.h, on the game's programs
 void oot_visual(Shader::IR::Program& program, uint64_t key) {
-    static const bool on = !getenv("RX_VK_OOT_VISUAL") || atoi(getenv("RX_VK_OOT_VISUAL")) != 0;
+    // (EvilOOT, 11-07: off unless RX_VK_OOT_VISUAL=1. With the foliage culling, the pointer reads and the first GPU work right, the
+    // game's own fog is the soft haze with sun shafts of the console's picture at Kokiri's rock; the 0.08 factor was tuned against
+    // the white wall those bugs made, and thinned every scene's fog)
+    static const bool on = getenv("RX_VK_OOT_VISUAL") && atoi(getenv("RX_VK_OOT_VISUAL")) != 0;
     if (!on) return;
     static const float fog = getenv("RX_VK_OOT_FOG") ? (float)atof(getenv("RX_VK_OOT_FOG")) : 0.08f;   // (0.25, Orchid's, left a white forest once the game no longer lost its start)
     // (1: the game's own exposure. 0.65 was for the washed-out outdoors before shaders followed pointers; with the lighting right it
