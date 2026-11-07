@@ -38,6 +38,7 @@
 
 namespace mkwvk {
 int64_t presents_now;   // (the presents so far, for SlowWatch)
+void hang_watch_start();   // (EvilOOT, vk_hangdump.cpp: RX_VK_HANG_DUMP)
 struct CondNote { int64_t present; uint64_t addr, x, y; int mode; bool on; };   // (the last render conditions, for a dark frame)
 CondNote cond_ring[1 << 15];
 uint32_t cond_ring_at = 0;
@@ -1961,6 +1962,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         full_barrier(r.cmd);
         presents++;
         presents_now = presents;
+        if (presents == 1) hang_watch_start();
         ts_anchor_ns = host->ticks() * 32;
         dump_present(presents);
         if (src && (dev.offscreen || shots) && offscreen_init()) {

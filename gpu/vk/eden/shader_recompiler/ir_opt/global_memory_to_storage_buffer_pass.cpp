@@ -462,59 +462,82 @@ std::optional<StorageBufferAddr> TrackTable(const IR::Value& value) {
 struct AddrOrigins {
     bool cbuf{}, load{}, branch{}, split{};
 };
-AddrOrigins Origins(const IR::Value& root, int depth = 0) {
-    AddrOrigins o;
+/// (11-07) One walk for the whole program, each instruction's origins kept: the first version walked up to 1024
+/// instructions per address and walked each side of every select or phi again, nested three deep, which on a compute
+/// shader with many loop phis ran for minutes on the submit's thread (the freeze after Load, vk_hangdump.cpp found it).
+/// Origins of an instruction = the union of its arguments' (a select's condition left out); split where a select or
+/// phi joins a side from constant buffer words only with a side from memory, or below. A phi's argument still being
+/// walked (a loop) adds nothing.
+thread_local std::unordered_map<const IR::Inst*, AddrOrigins> g_origins;
+AddrOrigins Origins(const IR::Value& root) {
     if (root.IsImmediate()) {
-        return o;
+        return {};
     }
-    boost::container::small_vector<const IR::Inst*, 64> stack{root.InstRecursive()};
-    std::unordered_set<const IR::Inst*> seen;
-    while (!stack.empty() && seen.size() < 1024) {
-        const IR::Inst* const inst{stack.back()};
-        stack.pop_back();
-        if (!seen.insert(inst).second) {
-            continue;
-        }
+    const IR::Inst* const top{root.InstRecursive()};
+    if (const auto it{g_origins.find(top)}; it != g_origins.end()) {
+        return it->second;
+    }
+    const auto is_cbuf{[](IR::Opcode op) { return op == IR::Opcode::GetCbufU32 || op == IR::Opcode::GetCbufU32x2; }};
+    const auto first_arg{[](IR::Opcode op) -> size_t {
+        return op == IR::Opcode::SelectU32 || op == IR::Opcode::SelectU64 ? 1 : 0;   // (not the condition)
+    }};
+    struct Frame {
+        const IR::Inst* inst;
+        size_t next;
+    };
+    std::vector<Frame> stack{{top, first_arg(top->GetOpcode())}};
+    std::unordered_set<const IR::Inst*> walking{top};
+    while (!stack.empty()) {
+        const IR::Inst* const inst{stack.back().inst};
         const IR::Opcode op{inst->GetOpcode()};
-        if (op == IR::Opcode::GetCbufU32 || op == IR::Opcode::GetCbufU32x2) {
+        const bool source{is_cbuf(op) || IsGlobalMemory(*inst)};
+        const IR::Inst* child{};
+        while (!source && !child && stack.back().next < inst->NumArgs()) {
+            const IR::Value arg{inst->Arg(stack.back().next++)};
+            if (arg.IsImmediate()) {
+                continue;
+            }
+            const IR::Inst* const a{arg.InstRecursive()};
+            if (!g_origins.contains(a) && !walking.contains(a)) {
+                child = a;
+            }
+        }
+        if (child) {
+            stack.push_back({child, first_arg(child->GetOpcode())});
+            walking.insert(child);
+            continue;
+        }
+        AddrOrigins o;
+        if (is_cbuf(op)) {
             o.cbuf = true;
-            continue;
-        }
-        if (IsGlobalMemory(*inst)) {
+        } else if (IsGlobalMemory(*inst)) {
             o.load = true;
-            continue;
-        }
-        size_t first{0};
-        switch (op) {
-        case IR::Opcode::Phi:
-            o.branch = true;
-            break;
-        case IR::Opcode::SelectU32:
-        case IR::Opcode::SelectU64:
-            o.branch = true;
-            first = 1;   // (not the condition)
-            break;
-        default:
-            break;
-        }
-        if (o.branch && !o.split && depth < 3 && (op == IR::Opcode::Phi || first == 1)) {
+        } else {
+            const size_t first{first_arg(op)};
+            const bool joins{op == IR::Opcode::Phi || first == 1};
             bool cbuf_only{}, from_memory{};
+            o.branch = joins;
             for (size_t i = first; i < inst->NumArgs(); ++i) {
-                const AddrOrigins side{Origins(inst->Arg(i), depth + 1)};
+                const IR::Value arg{inst->Arg(i)};
+                if (arg.IsImmediate()) {
+                    continue;
+                }
+                const auto it{g_origins.find(arg.InstRecursive())};
+                if (it == g_origins.end()) {
+                    continue;   // (a loop's phi, still being walked)
+                }
+                const AddrOrigins& side{it->second};
+                o.cbuf |= side.cbuf, o.load |= side.load, o.branch |= side.branch, o.split |= side.split;
                 cbuf_only |= side.cbuf && !side.load;
                 from_memory |= side.load;
-                o.split |= side.split;
             }
-            o.split |= cbuf_only && from_memory;
+            o.split |= joins && cbuf_only && from_memory;
         }
-        for (size_t i = first; i < inst->NumArgs(); ++i) {
-            const IR::Value arg{inst->Arg(i)};
-            if (!arg.IsImmediate()) {
-                stack.push_back(arg.InstRecursive());
-            }
-        }
+        g_origins.emplace(inst, o);
+        walking.erase(inst);
+        stack.pop_back();
     }
-    return o;
+    return g_origins[top];
 }
 /// (hookshot, from Lichii b8d81e20) Whether an address is a select or phi of which one input is a pointer loaded from memory: Ocarina's foliage
 /// placement records are read from c0[12] or from *c0[12]. Tracked to the constant buffer pointer alone, the loaded path read out of bounds
@@ -791,6 +814,7 @@ void Replace(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
 void GlobalMemoryToStorageBufferPass(IR::Program& program, const HostTranslateInfo& host_info) {
     static const bool no_mesh{std::getenv("RX_VK_FOLLOW_MESH") == nullptr};
     g_follow_stage = program.stage == Stage::Compute || (!no_mesh && (program.stage == Stage::Task || program.stage == Stage::Mesh));
+    g_origins.clear();   // (EvilOOT: Origins' walk, kept per program)
     StorageInfo info;
     for (IR::Block* const block : program.post_order_blocks) {
         for (IR::Inst& inst : block->Instructions()) {
