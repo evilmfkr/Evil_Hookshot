@@ -1402,15 +1402,34 @@ void publish_cap_ranges() {
     cap_ranges.swap(v);
     cap_ranges_ver++;
 }
+// (EvilOOT, 11-07) the game's own memory pool holding a GPU address (below 1 TB, where the address is the guest's), not the
+// import that happens to cover it: imports are 16 MB chunks around what was bound, and since upstream 1c7c9c7 only around
+// the bound range, so the pool's end was a chunk's end: the pointer tables of the task and mesh stages (whole pools) and the
+// bare entries stopped there, the grass's programs read their records 12-18 MB further on as 0 and culled every blade
+static bool game_pool_of(uint64_t gpu, uint64_t& lo, uint64_t& hi) {   // (pools_mu held)
+    if (gpu >= (1ull << 40) || guest_pools.empty()) return false;
+    auto it = std::upper_bound(guest_pools.begin(), guest_pools.end(), gpu, [](uint64_t a, const GuestPool& p) { return a < p.lo; });
+    if (it == guest_pools.begin()) return false;
+    --it;
+    if (gpu < it->lo || gpu >= it->hi) return false;
+    lo = it->lo, hi = it->hi;
+    return true;
+}
 uint64_t gpu_pool_end(uint64_t gpu) {
     ParLock plk;   // (before pools_mu, always)
     std::lock_guard lk(pools_mu);
+    uint64_t lo, hi;
+    static const bool imported_only = getenv("RX_VK_POOL_END_IMPORTED") != nullptr;   // (A/B: the import's end, as before)
+    if (!imported_only && game_pool_of(gpu, lo, hi)) return hi;
     const Pool* p = pool_of(gpu, 1);
     return p ? p->hi : 0;
 }
 uint64_t gpu_pool_start(uint64_t gpu) {   // (EvilOOT) where it begins
     ParLock plk;
     std::lock_guard lk(pools_mu);
+    uint64_t lo, hi;
+    static const bool imported_only = getenv("RX_VK_POOL_END_IMPORTED") != nullptr;
+    if (!imported_only && game_pool_of(gpu, lo, hi)) return lo;
     const Pool* p = pool_of(gpu, 1);
     return p ? p->lo : 0;
 }

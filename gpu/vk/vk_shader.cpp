@@ -521,7 +521,8 @@ uint32_t stage_cbuf_word(const NvnState& s, const Stage& st, uint32_t index, uin
         // handle read from it sampled their textures, for one frame: MKW's shadows in bands. RX_VK_HANDLES_LIVE=1:
         // as before)
         static const bool live = getenv("RX_VK_HANDLES_LIVE") != nullptr;
-        if (u.addr && (uint64_t)offset + 4 <= (uint64_t)u.size) {
+        // (EvilOOT: and a binding of no recorded size read as far as asked, as the storage buffer descriptors had it before)
+        if (u.addr && (!u.size || (uint64_t)offset + 4 <= (uint64_t)u.size)) {
             if (live) host->gpu_read(u.addr + offset, &v, 4);
             else ub_read(u.addr + offset, &v, 4);
         }

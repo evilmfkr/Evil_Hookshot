@@ -1549,7 +1549,8 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 // (AyyBeeDee20738, PR 138) a table entry's region that does not fit its pool this moment bound nothing, and the next
                 // frame bound it again: its reads flipped between the data and 0, the picture between bright and dark. Smaller,
                 // down to 1 MB, rather than nothing (and past what is bound the shaders' search now goes on to the page table)
-                if (!b.buffer && d.count > 1 && addr && plausible) {
+                static const bool no_shrink = getenv("RX_VK_NO_TABLE_SHRINK") != nullptr;   // (A/B: unbound as before)
+                if (!b.buffer && d.count > 1 && addr && plausible && !no_shrink) {
                     uint64_t m = n;
                     if (const uint64_t end = gpu_pool_end(base); end > base) m = std::min<uint64_t>(m, end - base);
                     for (; !b.buffer && m >= (1ull << 20); m = (m / 2) & ~3ull) {
