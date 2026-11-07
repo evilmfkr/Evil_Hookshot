@@ -2699,8 +2699,12 @@ std::mutex submit_order_mu;   // (captures and submits queued in the same order)
 void submit_q(const uint64_t* handles, int n, uint64_t queue) {
     if (!async_on()) {
         // (the replay here is on the submitting thread, but the game's other threads go on writing their next frames: a pool
-        // synced from guest memory later in the frame read those. RX_VK_SYNC_CAPTURE=1: the capture is taken here too)
-        static const bool capture = getenv("RX_VK_SYNC_CAPTURE") != nullptr;
+        // synced from guest memory later in the frame read those. The capture is taken here too)
+        // (EvilOOT) on by default: without it every mirror sync read guest memory as it was at the replay, the game's later
+        // frames. OoT's GPU culling alternates two list sets: every other frame its setup read the next frame's records,
+        // counted into the other set, and the foliage, grass, characters and particles of that frame were never drawn.
+        // With it the syncs take the submits' captures, as the console's GPU sees its memory. RX_VK_SYNC_CAPTURE=0: off.
+        static const bool capture = !getenv("RX_VK_SYNC_CAPTURE") || atoi(getenv("RX_VK_SYNC_CAPTURE")) != 0;
         if (capture) memory_capture_submit();
         // (RX_VK_SUBMIT_DELAY_US=<us> (a test): a console's GPU starts later than this replay does. Does what a submission reads
         // arrive just after it, from the game's other threads?)

@@ -137,20 +137,33 @@ void stats_dump_stage(uint64_t prog, const NvnState& s, int stage) {
         std::vector<uint32_t> w(n / 4);
         if (w.empty() || !memory_read_as_submitted(b.addr, w.data(), n)) return;
         uint64_t nonzero = 0, total = 0;   // (over the whole binding, up to 16 MB: is anything in it at all)
+        uint64_t first_nz = UINT64_MAX;    // (and where the data past the first 64 bytes starts, 64 words of it shown)
+        std::vector<uint32_t> at_nz;
         {
             const uint64_t all = std::min<uint64_t>(b.size, 16ull << 20) & ~3ull;
             std::vector<uint32_t> big(all / 4);
             if (!big.empty() && memory_read_as_submitted(b.addr, big.data(), all))
-                for (const uint32_t v : big) nonzero += v != 0, total++;
+                for (size_t i = 0; i < big.size(); i++) {
+                    nonzero += big[i] != 0, total++;
+                    if (big[i] && i >= 16 && first_nz == UINT64_MAX) first_nz = i * 4;
+                }
+            if (first_nz != UINT64_MAX && first_nz >= 0x400)
+                at_nz.assign(big.begin() + first_nz / 4, big.begin() + std::min<size_t>(big.size(), first_nz / 4 + 64));
         }
         std::string text;
-        char line[200];
-        snprintf(line, sizeof line, "%016llx s%d %s%d at %#llx size %#llx (game memory: %llu of %llu words non-zero):\n",
-                 (unsigned long long)prog, stage, kind, slot, (unsigned long long)b.addr, (unsigned long long)b.size,
-                 (unsigned long long)nonzero, (unsigned long long)total);
+        char line[240];
+        snprintf(line, sizeof line, "%016llx s%d %s%d at %#llx size %#llx (game memory: %llu of %llu words non-zero; first past "
+                 "+0x40 at %s%llx):\n", (unsigned long long)prog, stage, kind, slot, (unsigned long long)b.addr,
+                 (unsigned long long)b.size, (unsigned long long)nonzero, (unsigned long long)total, first_nz == UINT64_MAX ? "none " : "+",
+                 (unsigned long long)(first_nz == UINT64_MAX ? 0 : first_nz));
         text += line;
         for (size_t i = 0; i < w.size(); i += 4) {
             snprintf(line, sizeof line, "  +%03zx: %08x %08x %08x %08x\n", i * 4, w[i], w[i + 1], w[i + 2], w[i + 3]);
+            text += line;
+        }
+        for (size_t i = 0; i + 4 <= at_nz.size(); i += 4) {
+            snprintf(line, sizeof line, "  +%06llx: %08x %08x %08x %08x\n", (unsigned long long)(first_nz + i * 4), at_nz[i], at_nz[i + 1],
+                     at_nz[i + 2], at_nz[i + 3]);
             text += line;
         }
         std::lock_guard bl(stats_bind_mu);
