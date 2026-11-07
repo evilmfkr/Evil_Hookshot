@@ -1047,6 +1047,10 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             oot_visual(t->program, csc->key);
             Shader::RuntimeInfo rt{};
             dump_ir(p, "compute", t->program);   // (before the SPIR-V: the programs it fails on are the ones to read)
+            if (getenv("RX_VK_IR"))
+                logf("vk: compute %016llx: workgroup %ux%ux%u, shared memory %u bytes, local memory %u", (unsigned long long)p.key,
+                     t->program.workgroup_size[0], t->program.workgroup_size[1], t->program.workgroup_size[2],
+                     t->program.shared_memory_size, t->program.local_memory_size);
             // (hookshot) The movie upscaler's dozen networks, on a card that cannot run them as the console does: their software matrix multiplies
             // took minutes each for AMD's compiler (the black screen with sound, Hookshot issue 26: JaredEzz's analysis) and the movies ran at 10 fps
             // (issues 38, 43). Left out, the last pass becomes a linear upscale of the movie (upscale_stub in vk_draw.cpp): the same picture at 60

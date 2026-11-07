@@ -637,7 +637,8 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) 
                          op == IR::Opcode::GlobalAtomicIAdd32 || op == IR::Opcode::GlobalAtomicUMax32 || op == IR::Opcode::GlobalAtomicUMin32 ||
                          op == IR::Opcode::GlobalAtomicSMax32 || op == IR::Opcode::GlobalAtomicSMin32 || op == IR::Opcode::GlobalAtomicAnd32 ||
                          op == IR::Opcode::GlobalAtomicOr32 || op == IR::Opcode::GlobalAtomicXor32 || op == IR::Opcode::GlobalAtomicExchange32};
-        static const bool no_store{std::getenv("RX_VK_FOLLOW_LOADS_ONLY") != nullptr};
+        // (RX_VK_FOLLOW_STORES=1: the writes too. Off: they made the culling count but drew no leaves, and a GPU faulted in it, #132)
+        static const bool no_store{std::getenv("RX_VK_FOLLOW_STORES") == nullptr};
         if (follow && g_follow_stage && (load || (store && !no_store)) && MixesLoadedPointer(low_addr_info->value)) {
             return;   // (left global: MixesLoadedPointer)
         }

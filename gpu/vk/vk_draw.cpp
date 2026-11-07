@@ -7,6 +7,7 @@
 //
 // Pipelines persist in a VkPipelineCache next to the executable (mkw_vk_pipelines.bin).
 #include <algorithm>
+#include <filesystem>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -217,10 +218,13 @@ bool skip_live(uint64_t key) {
     std::lock_guard lk(mu);
     if (now >= next_check.load(std::memory_order_relaxed)) {
         next_check.store(now + 300, std::memory_order_relaxed);
-        WIN32_FILE_ATTRIBUTE_DATA fa{};
-        if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) {
-            const int64_t size = ((int64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
-            const int64_t time = ((int64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+        // (size and write time, portably: the Linux build has no GetFileAttributesExA)
+        std::error_code ec;
+        const auto fsize = std::filesystem::file_size(path, ec);
+        const auto ftime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
+        if (!ec) {
+            const int64_t size = (int64_t)fsize;
+            const int64_t time = (int64_t)ftime.time_since_epoch().count();
             if (size != last_size || time != last_time) {
                 last_size = size, last_time = time;
                 keys.clear();
@@ -600,6 +604,7 @@ bool depth_aspect(VkFormat f) {
 }
 
 // (hookshot) A driver's compiler that faults on a shader (amdvlk64.dll on a mesh program, Hookshot issue 26) costs that one draw, not the game
+#ifdef _WIN32
 __declspec(noinline) VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
     __try {
         return vkCreateGraphicsPipelines(dev.device, cache, 1, ci, nullptr, pl);
@@ -614,6 +619,15 @@ __declspec(noinline) VkResult guarded_compute(VkPipelineCache cache, const VkCom
         return (VkResult)-77;   // (a fault in the driver, told apart from what it returns)
     }
 }
+#else
+// (linux: no structured exceptions; the driver is called as it is)
+VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
+    return vkCreateGraphicsPipelines(dev.device, cache, 1, ci, nullptr, pl);
+}
+VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
+    return vkCreateComputePipelines(dev.device, cache, 1, ci, nullptr, pl);
+}
+#endif
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part = -1);
 
 /// A target's write mask: the state's channel mask, nothing for a target the fragment shader leaves unwritten
@@ -1529,7 +1543,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                     static const bool stretch = getenv("RX_VK_SSBO_STRETCH") != nullptr;
                     if (stretch && !d.is_written && addr && d.count == 1)
                         if (const uint64_t end = gpu_pool_end(base); end > base + n)
-                            n = std::max(n, std::min<uint64_t>(end - base, 64ull << 20) & ~3ull);
+                            n = std::max<uint64_t>(n, std::min<uint64_t>(end - base, 64ull << 20) & ~uint64_t{3});
                 }
                 // (EvilOOT) RX_VK_SSBO_WIDE=<MB>, experiment: single storage buffers bound from their base to the end of their
                 // pool (that many MB at most), so that a pointer loaded through the buffer and used with the buffer's binding
@@ -4507,11 +4521,12 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
     // did not end, and the next start goes without it. Those libraries are then built when a draw first needs them
     const std::string warming = path + ".warming";
     bool warm = gpl_wanted() && !getenv("RX_VK_NO_WARM");
+    bool warm_cs = !getenv("RX_VK_NO_WARM");
     if (FILE* f = fopen(warming.c_str(), "rb")) {
         fclose(f);
-        warm = false;
+        warm = warm_cs = false;
         logf("vk: the last start did not finish the driver's part of the shaders: left out");
-    } else if (warm) {
+    } else if (warm || warm_cs) {
         if (FILE* w = fopen(warming.c_str(), "wb")) fclose(w);
     }
     auto blank = std::make_unique<NvnState>();
@@ -4525,6 +4540,24 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
             if (i >= total) return;
             if (std::unique_ptr<Program> p = seed_program(i / 3, (int)(i % 3))) {
                 if (!p->failed) made++;
+                if (!p->failed && warm_cs && p->compute && !taau_key(p->key)) {
+                    // (hookshot) compute pipelines too, for the driver's own cache: built in play they stopped the game while the
+                    // driver compiled them, seconds each for the culling programs (53caac5f: 6.5 s, 41 s inlined), which looked like a hang
+                    ensure_layout(*p);
+                    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+                    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+                    ci.stage.module = p->stages[0].module;
+                    ci.stage.pName = "main";
+                    pin_subgroup(ci.stage, p->workgroup[0]);
+                    ci.layout = p->layout;
+                    if (getenv("RX_VK_NOOPT")) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+                    VkPipeline pl = VK_NULL_HANDLE;
+                    if (guarded_compute(VK_NULL_HANDLE, &ci, &pl) == VK_SUCCESS && pl) {
+                        vkDestroyPipeline(dev.device, pl, nullptr);
+                        libs++;
+                    }
+                }
                 if (!p->failed && warm && !p->compute) {
                     ensure_layout(*p);
                     Targets at{};

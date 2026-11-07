@@ -3,6 +3,7 @@
     python -I nx2/make_game.py --nup <file.nup> --out <folder> [--work <folder>] [--jobs <n>]
     python -I nx2/make_game.py --romfs <dir> --exefs <dir> --out <folder> [--work <folder>] [--jobs <n>]
     python -I nx2/make_game.py --check --nup <file.nup>       (or --exefs <dir>: is this the right game and version?)
+    python -I nx2/make_game.py --update <folder>             (a folder built before, again with these tools: the game files it keeps)
 
 The folder holds the executable and all it needs, started with a double click: nothing goes back into the repository, and no game
 data ever comes with the tools. Lines the app reads, each on its own line of stdout:
@@ -26,7 +27,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PY = [sys.executable, "-I", "-u", "-X", "utf8"]   # (utf8: every step's output in UTF-8 whatever the console's code page: lift.py crashed on a letter, #180)   # (-u: the steps' output as it comes, not in 8 KB blocks minutes apart)
 BUILD_ID = "e0f3ccfa"   # (the version the patches, the hot list and the profile were made from)
-BESIDE = ["hookshot.exe", "hookshot_vk.dll", "SDL2.dll", "wgpu_native.dll"]
+LINUX = os.name != "nt"
+BESIDE = ["hookshot", "hookshot_vk.so", "libSDL2-2.0.so.0"] if LINUX else ["hookshot.exe", "hookshot_vk.dll", "SDL2.dll", "wgpu_native.dll"]
 LANGUAGES = [("en-US", "English (US)"), ("en-GB", "English (UK)"), ("fr", "French (France)"), ("fr-CA", "French (Canada)"), ("de", "German"),
              ("it", "Italian"), ("es", "Spanish (Spain)"), ("es-419", "Spanish (Latin America)"), ("pt-BR", "Portuguese (Brazil)"), ("nl", "Dutch"),
              ("pl", "Polish"), ("ru", "Russian"), ("ja", "Japanese"), ("ko", "Korean"), ("zh-Hans", "Chinese (Simplified)"),
@@ -60,23 +62,45 @@ def fail(text):
     sys.exit(1)
 
 
+def failure_reason(lines):
+    """The line a stopped step is named with. Only the last 12 lines used to be kept, so a compiler's "error:" hundreds
+    of lines earlier was replaced by "compiled in 790s, 1 failed"."""
+    tail, seen = [], None
+    for line in lines:
+        tail = (tail + [line])[-12:]
+        if "error:" in line.lower() and "CalledProcessError" not in line:
+            seen = line
+    if seen is not None:
+        return seen
+    return tail[-1] if tail else "no output"
+
+
+def reported(line):
+    """The sentence a builder shows. @@check is '@@check <ok|bad> <text>'; @@error is '@@error <text>'. None otherwise."""
+    if line.startswith("@@error "):
+        return line[len("@@error "):]
+    if line.startswith("@@check "):
+        parts = line.split(" ", 2)
+        return parts[2] if len(parts) == 3 else ""
+    return None
+
+
 def run(cmd, env=None, on_line=None):
     e = dict(os.environ, PYTHONIOENCODING="utf-8")
     e.update(env or {})
     p = subprocess.Popen(cmd, cwd=ROOT, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                          errors="replace", bufsize=1)
     no_throttle(getattr(p, "_handle", None))
-    tail = []
+    lines = []
     for line in p.stdout:
         line = line.rstrip()
         print(line, flush=True)
-        tail = (tail + [line])[-12:]
+        lines.append(line)
         if on_line:
             on_line(line)
     if p.wait():
-        why = [l for l in tail if "error:" in l.lower() and "CalledProcessError" not in l]
         step = next((os.path.basename(c) for c in cmd[1:] if c.endswith(".py")), os.path.basename(cmd[-1]))   # (issue 154: not "-u")
-        fail("%s stopped: %s" % (step, why[-1] if why else tail[-1] if tail else "no output"))
+        fail("%s stopped: %s" % (step, failure_reason(lines)))
 
 
 def build_id(main):
@@ -220,8 +244,32 @@ def check_cpp_library(toolchain):
              "Visual Studio 2022 (or install it), then build again.")
 
 
+def check_linux_compiler():
+    """(linux) A C compiler that builds and links a program here (the AppImage's own clang and sysroot, else the system's):
+    found now, not 40 minutes in"""
+    sys.path.insert(0, os.path.join(ROOT, "third_party", "a64-kit", "tools"))
+    import toolchain
+    cc = toolchain.find("clang")
+    if not os.path.isfile(cc):
+        fail("No C compiler was found. Install clang (and lld), or use the Hookshot AppImage, which brings its own.")
+    sysroot = os.environ.get("HOOKSHOT_SYSROOT")
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "t.c")
+        with open(src, "w") as f:
+            f.write(chr(10).join(("#include <stdio.h>", "#include <pthread.h>", "int main(void) { return 0; }", "")))
+        r = subprocess.run([cc] + (["--sysroot=" + sysroot] if sysroot else []) + ["-fuse-ld=lld", src, "-o", os.path.join(d, "t")],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode:
+        print(r.stdout + r.stderr, flush=True)
+        errors = [l for l in r.stderr.splitlines() if "error" in l]
+        fail("The compiler could not build a test program: %s (install clang, lld and your system's C library headers: "
+             "libc6-dev on Debian and Ubuntu, glibc-devel on Fedora)" % (errors[0] if errors else "no message"))
+
+
 def check_windows_sdk():
     """The compiler is bundled; Microsoft's C library and Windows SDK may not be, by their licences. Found now, not 40 minutes in."""
+    if LINUX:
+        return check_linux_compiler()
     sys.path.insert(0, os.path.join(ROOT, "third_party", "a64-kit", "tools"))
     import toolchain
     # (an INCLUDE set for the whole machine, by an old Visual Studio or another tool, is all clang reads: without the Windows SDK's C
@@ -266,6 +314,72 @@ def check_windows_sdk():
     fail("The compiler could not run a test build: %s" % why)
 
 
+def drop_stale_objects(work):
+    """(issue 231) Objects compiled against other system headers are not reused. A first build that compiled with an old Visual Studio's
+    stdio.h (before 2015) left its objects in the cache; once the PC was fixed every later build reused them and the link failed on
+    __iob_func. The headers the compiler finds are noted, and when they change the compiled objects go"""
+    if LINUX:
+        return
+    sys.path.insert(0, os.path.join(ROOT, "third_party", "a64-kit", "tools"))
+    import hashlib
+    import toolchain
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "t.c")
+        with open(src, "w") as f:
+            f.write(chr(10).join(("#include <stdio.h>", "#include <stdlib.h>", "#include <windows.h>", "")))
+        r = subprocess.run([toolchain.need(toolchain.find("clang"))] + toolchain.native_target() + ["-M", src], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+    if r.returncode:
+        return
+    heads = sorted({h.lower() for h in re.findall(r"\S+\.h\b", r.stdout.replace("\\" + chr(10), " "))})
+    stamp = hashlib.sha1(chr(10).join(heads).encode()).hexdigest()
+    note = os.path.join(work, "system_headers.txt")
+    try:
+        with open(note) as f:
+            if f.read().strip() == stamp:
+                return
+    except OSError:
+        pass
+    for sub in (os.path.join(work, "objcache"), os.path.join(work, "sa", "build", "obj")):
+        if os.path.isdir(sub):
+            print("the system headers changed since the last build: its compiled objects are not reused (%s)" % sub, flush=True)
+            shutil.rmtree(sub, ignore_errors=True)
+    with open(note, "w") as f:
+        f.write(stamp + chr(10))
+
+
+def folder_language(out):
+    """the language a game folder was built in: the code line of its language.txt"""
+    try:
+        with open(os.path.join(out, "language.txt"), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and any(line == code for code, _ in LANGUAGES):
+                    return line
+    except OSError:
+        pass
+    return None
+
+
+def profile_readable(prof):
+    """(linux) the profile is made by a recent clang (the Windows tools'): an older one, the system's, cannot read it and stops the
+    build. Then the game is built without it (a little slower in play), not at all"""
+    if not LINUX:
+        return True
+    sys.path.insert(0, os.path.join(ROOT, "third_party", "a64-kit", "tools"))
+    import toolchain
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "t.c")
+        with open(src, "w") as f:
+            f.write("int f(int x) { return x + 1; }" + chr(10))
+        r = subprocess.run([toolchain.find("clang"), "-O2", "-Wno-everything", "-fprofile-instr-use=" + prof, "-c", src, "-o",
+                            os.path.join(d, "t.o")], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode:
+        print("this compiler cannot read the play profile (%s): building without it" % (r.stderr.strip().splitlines() or ["?"])[-1],
+              flush=True)
+    return r.returncode == 0
+
+
 def link_or_copy(src, dst):
     """the romfs by hard links where the disk allows: 26 GB not written twice"""
     files = [os.path.join(d, f) for d, _, fs in os.walk(src) for f in fs]
@@ -287,10 +401,13 @@ def main():
     p.add_argument("--romfs")
     p.add_argument("--exefs")
     p.add_argument("--out")
-    p.add_argument("--work", default=os.path.join(os.environ.get("LOCALAPPDATA", ROOT), "HookshotBuilder"))
-    p.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    p.add_argument("--work", default=os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "hookshot-builder")
+                   if LINUX else os.path.join(os.environ.get("LOCALAPPDATA", ROOT), "HookshotBuilder"))
+    # (HOOKSHOT_JOBS: fewer compilers on a PC short of memory; the AppImage's builds pass no --jobs)
+    p.add_argument("--jobs", type=int, default=int(os.environ.get("HOOKSHOT_JOBS") or 0) or max(1, (os.cpu_count() or 2) // 2))
     p.add_argument("--language", default="en-US", help="the game's language: a code from LANGUAGES, written to language.txt")
     p.add_argument("--check", action="store_true")
+    p.add_argument("--update", help="a game folder built before: built again from the game files it keeps (the game's update offer)")
     a = p.parse_args()
     os.makedirs(a.work, exist_ok=True)
     no_throttle()
@@ -299,23 +416,37 @@ def main():
         ctypes.WinDLL("kernel32").SetThreadExecutionState(0x80000000 | 0x00000001)
     if a.check:
         return check(a, a.work)
-    if not a.out or not (a.nup or (a.romfs and a.exefs)):
+    if a.update:
+        a.out = a.update
+        a.language = folder_language(a.update) or a.language
+    if not a.out or not (a.update or a.nup or (a.romfs and a.exefs)):
         fail("needs --out, and --nup or --romfs with --exefs")
     out = os.path.abspath(a.out)
     work = os.path.abspath(a.work)
     os.makedirs(out, exist_ok=True)
-    check_windows_sdk()
+    # (linux) the compiler probe waits until the compile. The game-free cache test stops at the lift, and a missing
+    # compiler is still said before the long compile, not after the package has been read
+    if not LINUX:
+        check_windows_sdk()
+    drop_stale_objects(work)
     exefs = os.path.join(work, "exefs")
     romfs = os.path.join(out, "romfs")
 
     say("stage", "read", "Reading your game files")
     shutil.rmtree(exefs, ignore_errors=True)
-    if a.nup:
+    kept = os.path.join(out, ".hookshot_exefs")   # (the game's code as read, kept in the folder: what an update builds from again)
+    if a.update:
+        if not os.path.isdir(kept) or not os.path.isdir(romfs):
+            fail("This game folder has no copy of the game files to update from: it was built before updates came in. Choose your game files "
+                 "in Hookshot Builder and build into the same folder once; updates after that work by themselves.")
+        check_cache_paths(out, (kept, romfs))
+        shutil.copytree(kept, exefs)
+        check_modules(exefs)
+    elif a.nup:
         # (what an earlier build left is not kept without a reason to trust it: builders before the compressed .nup fix wrote those files as
         # they lay, so a folder they left held broken game data, and the game crashed at start over its empty dictionaries)
         game = os.path.join(out, ".game")
         good = os.path.join(out, ".hookshot_romfs")
-        kept = os.path.join(out, ".hookshot_exefs")
         check_cache_paths(out, (game, good, kept, romfs))
         # (an update of the builder over the same .nup: nothing to read again, only what the build needs. Issues 21 and 28)
         st = os.stat(a.nup)
@@ -350,6 +481,9 @@ def main():
         shutil.copytree(a.exefs, exefs)   # (unpacked in place: the user's copy stays as it is)
         run(PY + ["nx2/unpack.py", exefs])
         link_or_copy(a.romfs, romfs)
+        check_cache_paths(out, (kept,))
+        shutil.rmtree(kept, ignore_errors=True)
+        shutil.copytree(exefs, kept)
     check_supported_build(exefs)
 
     # (made once on the development PC: lists of addresses and counts, no game code)
@@ -364,7 +498,7 @@ def main():
     env = {"OOT_WORK": work, "OOT_EXEFS": exefs, "OOT_ROMFS": romfs, "OOT_DUMP": out, "RX_RELEASE": "1", "A64_HOT_CHUNK": "1"}
     if os.path.exists(os.path.join(work, "hot_funcs.txt")):
         env["A64_HOT_FUNCS"] = os.path.join(work, "hot_funcs.txt")
-    if os.path.exists(os.path.join(work, "hookshot_pieces.prof")):
+    if os.path.exists(os.path.join(work, "hookshot_pieces.prof")) and profile_readable(os.path.join(work, "hookshot_pieces.prof")):
         env["RX_PGO"] = os.path.join(work, "hookshot_pieces.prof")
 
     say("stage", "lift", "Translating the game to PC code")
@@ -372,6 +506,8 @@ def main():
     if os.path.isfile(os.path.join(work, "sa", "gen", "code_hot.c")):
         run(PY + ["nx2/split_hot.py", os.path.join(work, "sa", "gen")], env)   # (eight files side by side: ~6 minutes, not 79)
 
+    if LINUX:
+        check_linux_compiler()
     say("stage", "compile", "Compiling")
     done = {"n": 0, "of": 1}
 
@@ -388,6 +524,8 @@ def main():
     built = os.path.join(work, "sa", "build")
     for name in BESIDE:
         if os.path.exists(os.path.join(built, name)):
+            if os.path.exists(os.path.join(out, name)):   # (linux: not over a running copy's file: a new one in its place)
+                os.remove(os.path.join(out, name))
             shutil.copy2(os.path.join(built, name), os.path.join(out, name))
     shutil.copy2(os.path.join(work, "sa", "image", "image.bin"), os.path.join(out, "image.bin"))
     # every shader of the game, for its first start to translate (gpu/vk/vk_shader.cpp seed_open). Without it the game still runs, compiling them
@@ -399,6 +537,15 @@ def main():
     with open(language, "w", encoding="utf-8", newline="\n") as f:
         f.write("# The game's language. Change the line below to one of the codes listed here, save, and start the game again.\n\n%s\n\n" % a.language)
         f.writelines("# %-8s %s\n" % l for l in LANGUAGES)
+    # (what the game's update offer reads, host/hos_update.c: which release these tools are, and where the builder that made the folder is)
+    version = os.path.join(ROOT, "version.txt")
+    if os.path.isfile(version):
+        with open(version, encoding="utf-8") as f:
+            tag = f.read().strip()
+        with open(os.path.join(out, "hookshot_version.txt"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("version=%s\n" % tag)
+            if os.environ.get("HOOKSHOT_BUILDER_EXE"):
+                f.write("builder=%s\n" % os.environ["HOOKSHOT_BUILDER_EXE"])
     say("done", out)
 
 
