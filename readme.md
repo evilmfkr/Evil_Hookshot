@@ -1,15 +1,16 @@
 <h1 align="center">
   <br>
   <a>
-  <img src="assets/hookshot.png" alt="Hookshot" width="200">
+  <img src="assets/hookshot.png" alt="Evil_Hookshot" width="200">
 </a>
 
   <br>
-  <b>Hookshot</b>
+  <b>Evil_Hookshot</b>
   <br>
 </h1>
 
-<h4 align="center">The Legend of Zelda: Ocarina of Time (Nintendo Switch 2) running natively on Windows & Linux, with no emulator.
+<h4 align="center">A Native Recompilation Of The Legend Of Zelda: Ocarina Of Time Nintendo Switch 2 Remake.
+Runs natively on Windows & Linux, with no emulator.
 </h4>
 
 <p align="center">
@@ -23,17 +24,19 @@
 </p>
 
 > [!NOTE]
-> **This is EvilBoyce's fork of Hookshot** (Discord: **evilmfkr**), kept up to date with upstream
-> ([NotRexed/Hookshot](https://github.com/NotRexed/Hookshot)). Its own fixes, aimed at Kokiri Forest looking as it does on
-> the console:
+> **Evil_Hookshot is EvilBoyce's own project** (Discord: **evilmfkr**). It started from
+> [NotRexed/Hookshot](https://github.com/NotRexed/Hookshot) (as of 7 November 2026) and goes its own way from there. Its own
+> fixes, aimed at Kokiri Forest looking as it does on the console:
 > - **Foliage:** the GPU culling of trees, ferns, grass, falling leaves and fireflies (storage buffer tables in the game's
 >   own constant buffers, bare table entries, NVN2 compute's buffer slots, indirect mesh records).
 > - **Lighting:** the ambient light probes (signs, plants and Link were black in the shade), the pond's water, and the
 >   game's own fog without the old fog/exposure workaround.
 > - **Stability:** the freeze after loading a save (Horizon's mutex handoff), GPU data kept across memory pool changes.
+> - **Tree leaves:** the folder listings' file/folder flag at the right place, so the game loads its leaf data (the trees had
+>   no canopies).
 > - **Tools:** per-draw GPU statistics, a hang watchdog, live bisection and memory watches for finding rendering bugs.
 >
-> Each change is explained in its commit message (branch `Evil`; the earlier ones are signed EvilOOT).
+> Each change is explained in its commit message (the earlier ones are signed EvilOOT).
 
 Hookshot is a static recompilation. The game's code is translated to C and compiled into a Windows program, the
 console's system software is reimplemented, and the Switch 2 graphics are rebuilt on Vulkan. All of this happens
@@ -285,12 +288,12 @@ looks like.
 Hookshot exists thanks to the work of many people:
 
 - **NotRexed**: Hookshot, BlueShell (Mario Kart World), Skybound (Tears of the Kingdom) and the a64-kit tools.
-- **EvilBoyce** (Discord: evilmfkr, [fork](https://github.com/evilmfkr/Hookshot)): Ocarina of Time's foliage culling, ambient
+- **EvilBoyce** (Discord: evilmfkr, [Evil_Hookshot](https://github.com/evilmfkr/Evil_Hookshot)): Ocarina of Time's foliage culling, ambient
   light, water and fog fixes, the freeze after Load, the exposure flashes, and the rendering diagnostics tools.
 - **[Eden](https://git.eden-emu.dev/eden-emu/eden)** and **Eglantine**: the shader recompiler and Switch 2 shader work.
 - **suyu**: the graphics decoders and the AArch64 translator.
 - **[seedds/nxnative](https://github.com/seedds/nxnative)**: reference for how task and mesh shaders work.
-- **[EvilBoyce / evilmfkr](https://github.com/evilmfkr/Hookshot)** (EvilOOT): the GPU culling that brings back Kokiri's foliage
+- **[EvilBoyce / evilmfkr](https://github.com/evilmfkr/Evil_Hookshot)** (EvilOOT): the GPU culling that brings back Kokiri's foliage
   (trees, ferns, grass, falling leaves, fireflies), the ambient light probes, the pond's water, the game's own fog, the freeze
   after Load (Horizon's mutex handoff) and the exposure flicker fix.
 - **[zortos293/Lichii](https://github.com/zortos293/Lichii)**: reference for Ampere shader lowering, and its compare-exchange retry fix.
