@@ -187,6 +187,7 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
         std::unique_lock lk(fg.mu);
         fg.cv.wait(lk, [] { return fg.jobs.empty() && !fg.sets[0].busy && !fg.sets[1].busy && !fg.sets[2].busy; });
     }
+    queue_flush();
     vkDeviceWaitIdle(dev.device);
     for (int i = 0; i < 2; i++) {
         drop_img(fg.frames[i]), drop_img(fg.lumas[i]), drop_img(fg.flows[i]);
@@ -307,12 +308,16 @@ void display_main() {
 
 } // namespace
 
+// The Insert menu's Frame generation is off at 0. While it was ignored, every present still copied the frame and
+// reduced it to luma (framegen_record), then a second thread showed it. Open areas paid for that on a full GPU and
+// gained no made frames. 2x and up is the interpolation; RX_VK_FRAMEGEN=0 keeps it off entirely.
+bool framegen_wanted(int menu_value, int allow) {
+    return allow && menu_value >= 2;
+}
+
 bool framegen_on() {
-    // (RX_VK_FRAMEGEN=1: the game's ~50 fps shown at ~100. Off by default: block-matched frames flashed on fast
-    // motion, the HUD and camera cuts)
-    // (hookshot: available unless RX_VK_FRAMEGEN=0; the Insert menu turns it on, off by default)
-    static const bool on = !getenv("RX_VK_FRAMEGEN") || atoi(getenv("RX_VK_FRAMEGEN")) != 0;
-    return on && !dev.offscreen && !fg.failed;
+    static const int allow = !getenv("RX_VK_FRAMEGEN") || atoi(getenv("RX_VK_FRAMEGEN")) != 0;
+    return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed;
 }
 
 VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {
@@ -325,6 +330,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         if (fg.cropped_w != cw || fg.cropped_h != ch) {
             {
                 std::lock_guard qk(dev.present_mu);
+                queue_flush_locked();
                 vkDeviceWaitIdle(dev.device);
             }
             drop_img(fg.cropped);
@@ -344,6 +350,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
     if (fg.scaled_w != dw || fg.scaled_h != dh) {
         {
             std::lock_guard qk(dev.present_mu);   // (the queue is idle only while nothing else submits to it)
+            queue_flush_locked();
             vkDeviceWaitIdle(dev.device);
         }
         drop_img(fg.scaled);
